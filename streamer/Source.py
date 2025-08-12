@@ -6,8 +6,8 @@ import socket
 import numpy as np
 import streamer.Datasources as ds
 
-#from pyk4a import PyK4A, Config, CalibrationType, ColorResolution, DepthMode
-#from pyk4a.calibration import Calibration
+from pyk4a import PyK4A, Config, CalibrationType, ColorResolution, DepthMode
+from pyk4a.calibration import Calibration
 
 class Source(ABC):
     @abstractmethod
@@ -205,7 +205,7 @@ class AzureKinectCameraStrategy(CameraStrategy):
         depth = capture.transformed_depth  # depth aligned to color
 
         intr = self.get_intrinsics()
-        return color, depth, CameraConfig(intr["fx"], intr["fy"], intr["ppx"], intr["ppy"])
+        return color, depth, ds.CameraConfig(intr["fx"], intr["fy"], intr["ppx"], intr["ppy"])
 
     def get_intrinsics(self):
         calib: Calibration = self.device.calibration

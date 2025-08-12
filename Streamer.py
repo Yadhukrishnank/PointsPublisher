@@ -10,8 +10,8 @@ In this example a InterneCamera is used as source. The Data is then send to the 
 """
 
 
-# Setup Source Camera example
-# strategy = s.RealSenseCameraStrategy(640, 480)
+#Setup Source Camera example
+# strategy = s.AzureKinectCameraStrategy(640, 480)
 # camera = s.CameraContext(strategy)
 # camera.init()
 # intrinsics = camera.get_intrinsics()
@@ -22,7 +22,7 @@ In this example a InterneCamera is used as source. The Data is then send to the 
 #     cy=intrinsics["ppy"]
 # )
 
-# --- Setup Source (RealSense if available, else Dummy) ---
+#--- Setup Source (RealSense if available, else Dummy) ---
 try:
     strategy = s.RealSenseCameraStrategy(640, 480)
     camera = s.CameraContext(strategy)
