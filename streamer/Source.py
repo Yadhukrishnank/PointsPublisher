@@ -204,6 +204,10 @@ class AzureKinectCameraStrategy(CameraStrategy):
         color = capture.color
         depth = capture.transformed_depth  # depth aligned to color
 
+    # Ensure 3-channel BGR for JPEG encoding
+        if color.ndim == 3 and color.shape[2] == 4:
+            color = cv2.cvtColor(color, cv2.COLOR_BGRA2BGR)
+
         intr = self.get_intrinsics()
         return color, depth, ds.CameraConfig(intr["fx"], intr["fy"], intr["ppx"], intr["ppy"])
 
