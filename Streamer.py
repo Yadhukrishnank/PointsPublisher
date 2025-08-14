@@ -4,6 +4,7 @@ import streamer.ProcessingStep as p
 import streamer.Actions as a
 import streamer.Datasources as ds
 import cv2
+import time
 
 """
 In this example a InterneCamera is used as source. The Data is then send to the Meta Quest
@@ -62,7 +63,7 @@ orig_w, orig_h = 1280, 720   # matches Azure color / transformed_depth
 
 
 # Setup Processing
-processing = p.DownSampling(blocksize=2)
+processing = p.DownSampling(blocksize=3)
 processing.set_next(p.EncodeRGBAsJPEG())
 
 
@@ -90,6 +91,10 @@ zmq_pub = a.ZMQPublishAction(culling, config_scaling=1.0)
 # a2.set_width_height(426, 240)
 actions.add_action(zmq_pub)
 
+last_log = time.time()
+frames_sec = 0
+valid_sec = 0
+after_cull_sec = 0
 
 # Run
 try:
@@ -125,6 +130,45 @@ try:
         # print(f"[TX] {w_proc}x{h_proc}, scale={scale_x:.6f}")
 
         actions.execute_all(rgb_proc, depth_proc)
+
+        # --- compute sender-side density (mirrors compute shader math) ---
+        # depth in meters
+        z = (depth_proc.astype(np.float32) * 0.001)
+
+        # valid depth mask
+        valid_mask = z > 0.0
+
+        # scaled intrinsics (same as what you send)
+        fx_s = cam_cfg.fx * zmq_pub.config_scaling
+        fy_s = cam_cfg.fy * zmq_pub.config_scaling
+        cx_s = cam_cfg.cx * zmq_pub.config_scaling
+        cy_s = cam_cfg.cy * zmq_pub.config_scaling
+
+        h_proc, w_proc = depth_proc.shape[:2]
+        uu, vv = np.meshgrid(np.arange(w_proc, dtype=np.float32),
+                            np.arange(h_proc, dtype=np.float32))
+        X = (uu - cx_s) * z / fx_s
+        Y = (vv - cy_s) * z / fy_s
+
+        c = culling
+        cull_mask = (valid_mask &
+                    (z >= c.zcullmin) & (z <= c.zcullmax) &
+                    (np.abs(X) <= c.x_cull) & (np.abs(Y) <= c.y_cull))
+
+        frames_sec += 1
+        valid_sec += int(valid_mask.sum())
+        after_cull_sec += int(cull_mask.sum())
+
+        now = time.time()
+        if now - last_log >= 1.0:
+            total_pts = w_proc * h_proc
+            fps_send = frames_sec / (now - last_log)
+            print(f"[SENDER] fps={fps_send:.1f}  frame={w_proc}x{h_proc} ({total_pts})  "
+                f"valid/s={valid_sec}  est_after_cull/s={after_cull_sec}")
+            last_log = now
+            frames_sec = valid_sec = after_cull_sec = 0
+
+
 
 except KeyboardInterrupt:
     pass

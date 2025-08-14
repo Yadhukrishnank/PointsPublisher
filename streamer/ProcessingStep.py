@@ -31,8 +31,13 @@ class ProcessingStep(ABC):
 
 class EncodeRGBAsJPEG(ProcessingStep):
     def _process(self, rgb_frame, depth_frame):
-        ret_rgb, rgb_buf = cv2.imencode('.jpg', rgb_frame)
+        # make sure it's 8-bit
+        if rgb_frame.dtype != np.uint8:
+            rgb_frame = rgb_frame.astype(np.uint8)
+        # higher quality
+        ret, rgb_buf = cv2.imencode('.jpg', rgb_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         return rgb_buf, depth_frame
+
 
 
 class DownSampling(ProcessingStep):
