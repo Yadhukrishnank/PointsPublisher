@@ -24,55 +24,22 @@ config = ds.CameraConfig(
 )
 orig_w, orig_h = 1280, 720   # matches Azure color / transformed_depth
 
-#--- Setup Source (RealSense if available, else Dummy) ---
-# try:
-#     strategy = s.RealSenseCameraStrategy(640, 480)
-#     camera = s.CameraContext(strategy)
-#     camera.init()
-#     intrinsics = camera.get_intrinsics()
-#     config = ds.CameraConfig(
-#         fx=intrinsics["fx"], fy=intrinsics["fy"],
-#         cx=intrinsics["ppx"], cy=intrinsics["ppy"]
-#     )
-#     orig_w, orig_h = intrinsics["width"], intrinsics["height"]
-#     print("[INFO] RealSense connected.")
-# except Exception as e:
-#     print("[WARN] No camera, using DummySource:", e)
+# --- Processing chain ---
 
-#     class DummySource(s.Source):
-#         def __init__(self, width=640, height=480):
-#             self.w, self.h = width, height
-#             self.t = 0
-#         def connect(self): pass
-#         def get_frame(self):
-#             # simple moving gradient RGB + sloped depth
-#             rgb = np.zeros((self.h, self.w, 3), np.uint8)
-#             rgb[..., 1] = (self.t % 255)
-#             rgb[..., 2] = np.linspace(0, 255, self.w, dtype=np.uint8)[None, :]
-#             depth = np.linspace(500, 2000, self.w*self.h, dtype=np.uint16).reshape(self.h, self.w)
-#             self.t += 1
-#             cfg = ds.CameraConfig(fx=591.4, fy=591.4, cx=self.w/2.0, cy=self.h/2.0)
-#             return rgb, depth, cfg
-#         def close(self): pass
+processing = p.DepthClampAndMask(z_min_m=0.25, z_max_m=1)
+processing.set_next(p.LocalMedianReject(win=5, thr_mm=60))
+processing.set_next(p.DownSampling(blocksize=3))
+processing.set_next(p.EncodeRGBAsJPEG()) 
 
-#     strategy = DummySource(640, 480)
-#     camera = s.CameraContext(strategy)
-#     camera.init()
-#     config = ds.CameraConfig(591.4, 591.4, 320.0, 240.0)
-#     orig_w, orig_h = 640, 480
-
-
-# Setup Processing
-processing = p.DownSampling(blocksize=3)
-processing.set_next(p.EncodeRGBAsJPEG())
+print("[OpenCV] CUDA devices:", getattr(cv2, "cuda", None) and cv2.cuda.getCudaEnabledDeviceCount())
 
 
 # Setup Aktionen
 
 # Culling, for the rendering in the MetaQuest
 culling = ds.Culling(
-    zcullmin = 0.01,
-    zcullmax = 2.0,
+    zcullmin = 0.05,
+    zcullmax = 1.0,
     x_cull = 1.0,
     y_cull = 1.0
 )
