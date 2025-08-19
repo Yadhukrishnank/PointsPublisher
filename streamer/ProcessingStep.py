@@ -86,7 +86,48 @@ class LocalMedianReject(ProcessingStep):
         out[valid & (diff > self.thr)] = 0
         return rgb, out
 
-    
+
+# --- add to ProcessingStep.py ---
+
+class CropROI(ProcessingStep):
+    """
+    Crop a rectangular ROI in pixel coordinates: (x0, y0, w, h).
+    Works on both RGB (H×W×C) and depth (H×W).
+    """
+    def __init__(self, x0: int, y0: int, w: int, h: int):
+        super().__init__()
+        self.x0 = int(max(0, x0))
+        self.y0 = int(max(0, y0))
+        self.w  = int(max(1, w))
+        self.h  = int(max(1, h))
+
+    # IMPORTANT: override _process, not process
+    def _process(self, rgb, depth):
+        # infer frame size from whichever is present
+        if depth is not None:
+            H, W = depth.shape[:2]
+        elif rgb is not None:
+            H, W = rgb.shape[:2]
+        else:
+            return rgb, depth
+
+        # clamp ROI to bounds
+        x1 = min(self.x0 + self.w, W)
+        y1 = min(self.y0 + self.h, H)
+        x0 = min(self.x0, x1 - 1)
+        y0 = min(self.y0, y1 - 1)
+
+        # crop
+        if rgb is not None:
+            rgb = rgb[y0:y1, x0:x1].copy()
+        if depth is not None:
+            depth = depth[y0:y1, x0:x1].copy()
+
+        # return cropped pair; the base class will pass it to next step
+        return rgb, depth
+
+
+
 class EncodeRGBAsJPEG(ProcessingStep):
     def _process(self, rgb_frame, depth_frame):
         # make sure it's 8-bit
