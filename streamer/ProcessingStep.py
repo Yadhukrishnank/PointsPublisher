@@ -62,6 +62,10 @@ class DepthClampAndMask(ProcessingStep):
         return rgb_frame, out
     
 
+
+
+
+
 class LocalMedianReject(ProcessingStep):
     """
     Suppress isolated depth spikes by comparing to a local median.

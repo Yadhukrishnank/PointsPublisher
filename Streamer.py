@@ -44,12 +44,12 @@ orig_w, orig_h = 1280, 720  # Azure color / transformed_depth
 # ---------- processing chain ----------
 # ROI in *full-res* pixel coords (before downsample)
 roi_x0, roi_y0 = 160, 90
-roi_w, roi_h = 960, 540
+roi_w, roi_h = 640, 360
 
-blocksize = 3  # downsample factor (1 = off)
+blocksize = 2  
 
 processing = p.DepthClampAndMask(z_min_m=0.25, z_max_m=1.0)
-processing.set_next(p.LocalMedianReject(win=5, thr_mm=60)) \
+processing.set_next(p.LocalMedianReject(win=3, thr_mm=120)) \
           .set_next(p.CropROI(roi_x0, roi_y0, roi_w, roi_h)) \
           .set_next(p.DownSampling(blocksize=blocksize)) \
           .set_next(p.EncodeRGBAsJPEG())
