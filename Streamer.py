@@ -48,18 +48,16 @@ roi_w, roi_h = 640, 360
 
 blocksize = 1
 
-processing = p.DepthClampAndMask(z_min_m=0.25, z_max_m=1.0)
+processing = p.DepthClampAndMask(z_min_m=0.25, z_max_m=4.0)
 processing.set_next(p.LocalMedianReject(win=3, thr_mm=120)) \
-          .set_next(p.CropROI(roi_x0, roi_y0, roi_w, roi_h)) \
           .set_next(p.DownSampling(blocksize=blocksize)) \
           .set_next(p.EncodeRGBAsJPEG())
 
-print("[OpenCV] CUDA devices:", getattr(cv2, "cuda", None) and cv2.cuda.getCudaEnabledDeviceCount())
-
+        #   .set_next(p.CropROI(roi_x0, roi_y0, roi_w, roi_h)) \
 # ---------- actions / publisher ----------
 culling = ds.Culling(
     zcullmin=0.05,
-    zcullmax=1.0,
+    zcullmax=4.0,
     x_cull=1.0,
     y_cull=1.0,
 )
@@ -114,10 +112,6 @@ try:
         rgb_len = int(rgb_proc.nbytes) if hasattr(rgb_proc, "nbytes") else len(bytes(rgb_proc))
         depth_len = int(depth_proc.size * depth_proc.dtype.itemsize)  # W*H*2
 
-        logging.info(
-            f"[PROC] ROI=({roi_x0},{roi_y0},{roi_w}x{roi_h})  DS={blocksize}  OUT={w_proc}x{h_proc}  "
-            f"JPEG={human_bytes(rgb_len)}  DEPTH={human_bytes(depth_len)}"
-        )
 
         # 7) Telemetry (mirrors GPU math) — uses CROPPED+SCALED intrinsics
         z = depth_proc.astype(np.float32) * 0.001  # meters
@@ -159,6 +153,7 @@ try:
             logging.info(
                 f"[SENDER] fps={fps_send:.1f}  frame={w_proc}x{h_proc} ({total_pts})  "
                 f"valid/s={valid_sec}  est_after_cull/s={after_cull_sec}  "
+                f"JPEG={human_bytes(rgb_len)}  DEPTH={human_bytes(depth_len)}"
                 f"est_size/frame≈{human_bytes(rgb_len + depth_len)}"
             )
             last_log = now
@@ -169,3 +164,10 @@ except KeyboardInterrupt:
 finally:
     camera.close()
     cv2.destroyAllWindows()
+
+logging.info(
+    f"[SENDER] fps={fps_send:.1f}  frame={w_proc}x{h_proc} ({total_pts})  "
+    f"valid/s={valid_sec}  est_after_cull/s={after_cull_sec}  "
+    f"est_size/frame≈{human_bytes(rgb_len + depth_len)}  "
+
+)
