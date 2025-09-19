@@ -240,7 +240,7 @@ class AzureKinectCameraStrategy(CameraStrategy):
             return ColorResolution.RES_720P  # default
 
     def _get_depth_mode(self):
-        return DepthMode.NFOV_UNBINNED  # 640x576 (highest quality narrow FOV)
+        return DepthMode.NFOV_2X2BINNED # 640x576 (highest quality narrow FOV)
 
     def apply_filters(self, depth_frame):
         pass

@@ -96,7 +96,7 @@ class LocalMedianReject(ProcessingStep):
 class CropROI(ProcessingStep):
     """
     Crop a rectangular ROI in pixel coordinates: (x0, y0, w, h).
-    Works on both RGB (H×W×C) and depth (H×W).
+    Works on both RGB (H×W×C) and depth (H×W). 2d cropping only
     """
     def __init__(self, x0: int, y0: int, w: int, h: int):
         super().__init__()
