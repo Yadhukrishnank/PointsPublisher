@@ -6,7 +6,7 @@ import socket
 import numpy as np
 import streamer.Datasources as ds
 
-from pyk4a import PyK4A, Config, CalibrationType, ColorResolution, DepthMode
+from pyk4a import PyK4A, Config, CalibrationType, ColorResolution, DepthMode, FPS
 from pyk4a.calibration import Calibration
 
 class Source(ABC):
@@ -192,6 +192,7 @@ class AzureKinectCameraStrategy(CameraStrategy):
         self.device = PyK4A(Config(
             color_resolution=self._get_color_resolution(),
             depth_mode=self._get_depth_mode(),
+            camera_fps= self._get_camera_fps(),
             synchronized_images_only=True
         ))
         self.device.start()
@@ -240,7 +241,10 @@ class AzureKinectCameraStrategy(CameraStrategy):
             return ColorResolution.RES_720P  # default
 
     def _get_depth_mode(self):
-        return DepthMode.NFOV_2X2BINNED # 640x576 (highest quality narrow FOV)
+        return DepthMode.NFOV_UNBINNED # 640x576 (highest quality narrow FOV)
+    
+    def _get_camera_fps(self):
+        return FPS.FPS_30
 
     def apply_filters(self, depth_frame):
         pass
