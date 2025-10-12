@@ -1,9 +1,28 @@
-# Ignore compiled Python files
+# Python bytecode & caches
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# Ignore virtual environments
+# Virtual envs
+.venv/
 .venv311/
+venv/
 
-# Ignore log files
-*.log
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+
+# Env files
+.env
+.env.*
