@@ -13,7 +13,6 @@ except Exception:
 
 from Datasources import CameraConfig
 
-
 # -------------------- Data containers --------------------
 
 @dataclass
@@ -36,8 +35,7 @@ class PairedBundle:
     B: CamBundle
     dt_ms: float
 
-
-# -------------------- OAK devices (unchanged) --------------------
+# -------------------- OAK devices --------------------
 
 class OAKSingleDevice:
     """One OAK: RGB (preview) + depth aligned to RGB size."""
@@ -101,7 +99,6 @@ class OAKSingleDevice:
         try: self.dev.close()
         except: pass
 
-
 class MultiOAKSource:
     """Pairs two OAK devices by host timestamp with tolerance."""
     def __init__(self, mx_a: str, mx_b: str, tol_ms: float = 25.0, **kwargs):
@@ -148,7 +145,6 @@ class MultiOAKSource:
     def close(self):
         self.A.close(); self.B.close()
 
-
 # -------------------- Dummy devices (tinted so you can tell A/B apart) --------------------
 
 class DummySingleDevice:
@@ -159,8 +155,8 @@ class DummySingleDevice:
     def __init__(self,
                  width=640, height=360, fps=30,
                  fx=591.4, fy=591.4,
-                 # BGR tint (because OpenCV is BGR)
-                 tint_bgr=(255, 200, 0),    # default cyan-ish
+                 # BGR tint (OpenCV uses BGR)
+                 tint_bgr=(255, 200, 0),    # cyan-ish
                  tint_alpha=0.35,
                  label_text=None,
                  border_px=8):
@@ -186,10 +182,9 @@ class DummySingleDevice:
         base[..., 2] = 0.25 + 0.5 * (xs * ys)           # R
         self.base_rgb = np.clip(base * 255.0, 0, 255).astype(np.uint8)
 
-        self.col_ramp = (xs * 255.0).astype(np.uint8)   # used for subtle animation if desired
-
-        # Depth base plane (in mm); we perturb with a small sinusoidal wobble per frame
-        self.depth_base = ( (0.80 + 1.70 * (0.25 * xs + 0.75 * ys)) * 1000.0 ).astype(np.uint16)  # 0.8..2.5 m
+        # Depth base plane (mm); add small wobble
+        self.depth_base = ((0.80 + 1.70 * (0.25 * xs + 0.75 * ys)) * 1000.0).astype(np.uint16)  # 0.8..2.5 m
+        self.depth_base = self.depth_base.reshape(self.h, self.w)
 
         # Border mask
         if self.border_px > 0:
@@ -205,7 +200,7 @@ class DummySingleDevice:
     def _apply_tint(self, img_bgr: np.ndarray) -> np.ndarray:
         if self.tint_alpha <= 0.0001:
             return img_bgr
-        # cv2.addWeighted handles rounding/saturation; broadcast a solid tint image
+        # cv2.addWeighted handles rounding/saturation; we blend a solid tint layer
         return cv2.addWeighted(img_bgr, 1.0 - self.tint_alpha,
                                np.full_like(img_bgr, self.tint_bgr, dtype=np.uint8),
                                self.tint_alpha, 0.0)
@@ -219,9 +214,9 @@ class DummySingleDevice:
                         thickness=3, lineType=cv2.LINE_AA)
 
     def try_get(self):
-        # RGB: start from base gradient
+        # RGB: base gradient + subtle animation
         rgb = self.base_rgb.copy()
-        # Optionally add a tiny time animation (green shift)
+        # small time-based shift in G channel so frames aren't static
         rgb[..., 1] = (rgb[..., 1].astype(np.int32) + (self.t % 255)).clip(0, 255).astype(np.uint8)
         # Apply tint & decorations
         rgb = self._apply_tint(rgb)
@@ -237,7 +232,6 @@ class DummySingleDevice:
         return Frame(rgb=rgb, depth=depth, ts_host_s=ts, w=self.w, h=self.h)
 
     def close(self): pass
-
 
 class MultiDummySource:
     """

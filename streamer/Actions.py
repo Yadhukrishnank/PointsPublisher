@@ -2,7 +2,7 @@
 import struct
 import socket
 import threading
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import cv2
@@ -12,7 +12,7 @@ from Datasources import CameraConfig, Culling, scale_intrinsics
 
 
 class UdpDiscoveryServer:
-    """Responds to UDP broadcasts so the Quest can discover the ZMQ endpoint."""
+    """Responds to UDP broadcasts so the Quest/Unity can discover the ZMQ endpoint."""
     def __init__(self, port: int = 5556, response: bytes = b"ZMQ_SERVER_HERE"):
         self.port = port
         self.response = response
@@ -43,6 +43,7 @@ class UdpDiscoveryServer:
 class ZMQPublishMuxAction:
     """
     Single PUSH socket (one port) that carries frames for multiple cameras.
+
     Packet layout (little-endian):
       uint8  cam_id
       uint8  flags (0)
@@ -60,11 +61,14 @@ class ZMQPublishMuxAction:
     def __init__(self, port: int = 5555, discovery_port: int = 5556):
         self.ctx = zmq.Context.instance()
         self.sock = self.ctx.socket(zmq.PUSH)
-        self.sock.setsockopt(zmq.SNDHWM, 1)  # drop old frames if client is slow
+        # ------- IMPORTANT: allow two back-to-back frames (cam0, cam1) without dropping -------
+        self.sock.setsockopt(zmq.SNDHWM, 8)   # more headroom than 1; keeps latency low but avoids constant drops
+        self.sock.setsockopt(zmq.LINGER, 0)   # don't stall on shutdown
         self.sock.bind(f"tcp://*:{port}")
         self.discovery = UdpDiscoveryServer(discovery_port)
         self.discovery.start()
-        print(f"[ZMQ] PUSH bound tcp://*:{port}, UDP discovery on {discovery_port}")
+        self._drops = [0, 0]  # per-cam drop counters
+        print(f"[ZMQ] PUSH bound tcp://*:{port}, UDP discovery on {discovery_port} | SNDHWM=8, LINGER=0")
 
     def close(self):
         try:
@@ -87,7 +91,7 @@ class ZMQPublishMuxAction:
         rgb_jpeg_bytes: bytes,
         depth_u16: np.ndarray,
         ds_block: int = 1,
-        roi_off=(0, 0),
+        roi_off: Tuple[int, int] = (0, 0),
     ):
         # Scale intrinsics for downsample and ROI (if any)
         scale = 1.0 / float(ds_block) if ds_block > 1 else 1.0
@@ -118,9 +122,13 @@ class ZMQPublishMuxAction:
         try:
             self.sock.send(packet, zmq.NOBLOCK)
         except zmq.Again:
-            # Drop if consumer is slow — keeps latency low
-            pass
-
+            # drop if consumer is slow — keeps latency low
+            if 0 <= cam_id < 2:
+                self._drops[cam_id] += 1
+                if (self._drops[cam_id] % 30) == 1:
+                    print(f"[ZMQ] DROP cam{cam_id}: total={self._drops[cam_id]} (consider raising SNDHWM)")
+            else:
+                print("[ZMQ] DROP (unknown cam id)")
 
 class PreviewAction:
     """
@@ -136,67 +144,42 @@ class PreviewAction:
         self._last_key = -1
         cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
 
-    def _decode_rgb(self, rgb_jpeg_bytes: bytes) -> Optional[np.ndarray]:
-        if not rgb_jpeg_bytes:
-            return None
-        arr = np.frombuffer(rgb_jpeg_bytes, np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
+    def _decode_rgb(self, jpg_bytes: bytes) -> np.ndarray:
+        if isinstance(jpg_bytes, (bytes, bytearray)) and len(jpg_bytes) > 0:
+            arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is not None:
+                return img
+        # fallback
+        return np.zeros((1, 1, 3), np.uint8)
 
-    def _colorize_depth(self, depth_u16: np.ndarray) -> np.ndarray:
-        d = depth_u16.astype(np.float32) * 0.001  # mm -> m
-        mask0 = d <= 0
-        # normalize to [0..255]
-        lo, hi = self.zmin, self.zmax
-        rng = max(hi - lo, 1e-6)
-        d = np.clip((d - lo) / rng, 0.0, 1.0)
-        d[mask0] = 0.0
-        gray = (d * 255.0).astype(np.uint8)
-        col = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
-        col[mask0] = (0, 0, 0)
-        return col
+    def _depth_vis(self, depth_u16: np.ndarray) -> np.ndarray:
+        d = depth_u16.astype(np.float32)
+        d[d <= 0] = np.nan
+        zmin = self.zmin * 1000.0
+        zmax = self.zmax * 1000.0
+        d = np.clip((d - zmin) / (zmax - zmin), 0.0, 1.0)
+        d = (255.0 * (1.0 - d)).astype(np.uint8)  # near=bright
+        return cv2.applyColorMap(d, cv2.COLORMAP_TURBO)
 
-    def show(self, cam_id: int, rgb_jpeg_bytes: bytes, depth_u16: np.ndarray, info_text: Optional[str] = None) -> bool:
-        rgb = self._decode_rgb(rgb_jpeg_bytes)
-        dep = self._colorize_depth(depth_u16) if depth_u16 is not None else None
-        if rgb is None and dep is None:
-            return False
-
-        # size match & side-by-side
-        if rgb is None:
-            rgb = np.zeros_like(dep)
-        if dep is None:
-            dep = np.zeros_like(rgb)
-        if rgb.shape[:2] != dep.shape[:2]:
-            dep = cv2.resize(dep, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
-        row = np.concatenate([rgb, dep], axis=1)
-
-        # overlays
-        h, w = row.shape[:2]
-        cam_label = f"Cam {'A' if cam_id == 0 else 'B'}  {w//2}x{h}"
-        cv2.putText(row, cam_label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    def show(self, cam_id: int, rgb_jpg: bytes, depth_u16: np.ndarray, info_text: Optional[str] = None) -> bool:
+        rgb = self._decode_rgb(rgb_jpg)
+        dep = self._depth_vis(depth_u16)
+        H = max(rgb.shape[0], dep.shape[0])
+        rgb = cv2.resize(rgb, (dep.shape[1], dep.shape[0]), interpolation=cv2.INTER_LINEAR)
+        row = np.hstack([rgb, dep])
         if info_text:
-            cv2.putText(row, info_text, (12, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 230, 50), 2, cv2.LINE_AA)
-
+            cv2.putText(row, info_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
         self._rows[cam_id] = row
 
-        # mosaic with rows for A and B
-        rows = [r for r in [self._rows.get(0), self._rows.get(1)] if r is not None]
-        if not rows:
-            return False
-        if len(rows) == 1:
-            mosaic = rows[0]
-        else:
-            w0, w1 = rows[0].shape[1], rows[1].shape[1]
-            if w0 != w1:
-                tgt = max(w0, w1)
-                def pad(img):
-                    pad = tgt - img.shape[1]
-                    if pad <= 0: return img
-                    return np.pad(img, ((0, 0), (0, pad), (0, 0)), mode="constant")
-                rows = [pad(rows[0]), pad(rows[1])]
-            mosaic = np.vstack(rows)
+        if self._rows[0] is not None and self._rows[1] is not None:
+            # stack rows
+            w = max(self._rows[0].shape[1], self._rows[1].shape[1])
+            r0 = cv2.resize(self._rows[0], (w, self._rows[0].shape[0]))
+            r1 = cv2.resize(self._rows[1], (w, self._rows[1].shape[0]))
+            mosaic = np.vstack([r0, r1])
+            cv2.imshow(self.win, mosaic)
 
-        cv2.imshow(self.win, mosaic)
         self._last_key = cv2.waitKey(1) & 0xFF
         return self._last_key == ord('q')
 
