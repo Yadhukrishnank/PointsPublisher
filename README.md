@@ -2,7 +2,7 @@
 
 # On Windows.
 
-Create an python virtual environment (Python 3.11)
+Create an virtual environment. Here i am using (Python 3.11)
 
 `py -3.11 -m venv .venv311` 
 
