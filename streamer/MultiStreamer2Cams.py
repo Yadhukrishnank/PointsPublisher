@@ -1,261 +1,188 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-MultiStreamer2Cams.py  (hardcoded MX IDs, simple extrinsics loading)
-Two RGB-D cameras (or --dummy) → processing chain → single-port ZMQ publisher + preview.
-
-Extrinsics (no flags):
-- Looks for two files in the same folder as this script:
-    extrinsics_cam0.npz   (pose for camera 0)
-    extrinsics_cam1.npz   (pose for camera 1)
-- Dummy mode: missing -> identity (logged)
-- Real mode: missing -> error and exit
-"""
-
+import os
 import time
 import argparse
-import signal
-import sys
-from pathlib import Path
 import numpy as np
+import cv2
 
-from Source import MultiOAKSource, MultiDummySource
+from Datasources import Culling, load_extrinsics_npz
 from ProcessingStep import (
-    DepthClampAndMask,
-    LocalMedianReject,
-    CropROI,
-    DownSampling,
-    EncodeRGBAsJPEG,
+    ProcessingStep, DepthClampAndMask, LocalMedianReject, CropROI, DownSampling, EncodeRGBAsJPEG
 )
-from Actions import ZMQPublishMuxAction, PreviewAction
-from Datasources import Culling
+from Source import MultiOAKSource, MultiDummySource
+from Actions import ZMQPublishMuxAction, PreviewMosaic
 
-# --------- Hardcoded OAK MX IDs (edit these to your devices) ----------
-MX_ID_CAM0 = "184430102111900E00"   # camera 0 (A)
-MX_ID_CAM1 = "19443010B11CEF1200"   # camera 1 (B)
+# --------- Replace with your MX IDs ----------
+MX_ID_CAM0 = "184430102111900E00"   # camera 0
+MX_ID_CAM1 = "19443010B11CEF1200"   # camera 1
 
-# --------- Simple defaults ----------
 DEFAULTS = dict(
     rgb_w=1280, rgb_h=720, fps=30,
     pair_tol_ms=25.0,
     zmq_port=5555, discovery_port=5556,
     use_roi=False, roi_x0=160, roi_y0=90, roi_w=640, roi_h=360,
-    downsample_block=2,      # 1 = off ; 2 → 640x360 from 1280x720
+    downsample_block=4,
     z_min_m=0.25, z_max_m=4.0,
     cull_zmin=0.05, cull_zmax=4.0, cull_x=1.0, cull_y=1.0,
-    jpeg_quality=80,
+    jpeg_quality=80
 )
 
-# --------- Extrinsics files (next to this script) ----------
-SCRIPT_DIR = Path(__file__).resolve().parent
-EXTR_A = SCRIPT_DIR / "extrinsics_cam0.npz"
-EXTR_B = SCRIPT_DIR / "extrinsics_cam1.npz"
-
-def _log_T(tag: str, T: np.ndarray, src: str):
-    t = T[:3, 3]
-    print(f"[Extrinsics] {tag}: {src}")
-    print(f"             T_wc translation (m) = [{t[0]:+.3f}, {t[1]:+.3f}, {t[2]:+.3f}]")
-
-def _load_T_wc_or_identity(path: Path, allow_identity: bool, tag: str) -> np.ndarray:
-    """
-    Load a 4x4 world_from_camera matrix from a .npz with common keys.
-    If missing and allow_identity=True, returns identity (and logs).
-    """
-    if not path.exists():
-        if allow_identity:
-            T = np.eye(4, dtype=np.float32)
-            print(f"[Extrinsics] {tag}: MISSING -> using IDENTITY (dummy fallback)")
-            _log_T(tag, T, "IDENTITY")
-            return T
-        else:
-            print(f"[ERROR] Missing extrinsics for {tag}: expected '{path.name}' next to this script.")
-            sys.exit(1)
-
-    try:
-        data = np.load(path)
-        # Try common keys
-        for k in ("T_wc", "T", "world_from_camera", "matrix"):
-            if k in data:
-                T = np.array(data[k], dtype=np.float32)
-                break
-        else:
-            # If only one array in the file, take it
-            keys = list(data.keys())
-            if len(keys) == 1:
-                T = np.array(data[keys[0]], dtype=np.float32)
-            else:
-                raise KeyError("no suitable key found (expected T_wc/T/world_from_camera/matrix)")
-        T = T.reshape(4, 4).astype(np.float32)
-        _log_T(tag, T, f"file: {path.name}")
-        return T
-    except Exception as e:
-        if allow_identity:
-            T = np.eye(4, dtype=np.float32)
-            print(f"[Extrinsics] {tag}: ERROR reading '{path.name}' -> using IDENTITY (dummy fallback) [{e}]")
-            _log_T(tag, T, "IDENTITY")
-            return T
-        else:
-            print(f"[ERROR] Failed to read extrinsics for {tag} from '{path.name}': {e}")
-            sys.exit(1)
-
-# --------- Processing chain ----------
-def build_chain(use_roi, roi_x0, roi_y0, roi_w, roi_h, downsample_block, z_min_m, z_max_m, jpeg_quality):
+def build_chain(use_roi, roi_x0, roi_y0, roi_w, roi_h, downsample_block, z_min_m, z_max_m, jpeg_quality) -> ProcessingStep:
     root = DepthClampAndMask(z_min_m=z_min_m, z_max_m=z_max_m)
-    root.set_next(LocalMedianReject(win=3, thr_mm=120))
+    tail = root
+    tail = tail.set_next(LocalMedianReject(win=3, thr_mm=120))
     if use_roi:
-        root.set_next(CropROI(roi_x0, roi_y0, roi_w, roi_h))
-    root.set_next(DownSampling(downsample_block)) \
-        .set_next(EncodeRGBAsJPEG(quality=jpeg_quality))
+        tail = tail.set_next(CropROI(roi_x0, roi_y0, roi_w, roi_h))
+    tail = tail.set_next(DownSampling(downsample_block))
+    tail = tail.set_next(EncodeRGBAsJPEG(quality=jpeg_quality))
     return root
 
-# --------- Signal handling ----------
-class _StopFlag:
-    def __init__(self): self.stop = False
+def _normalize(rgb_jpg: bytes, depth_u16, w, h):
+    # depth: ensure (h,w) uint16, C-contiguous
+    if depth_u16 is None:
+        depth_u16 = np.zeros((h, w), np.uint16)
+    else:
+        d = np.asarray(depth_u16)
+        if d.ndim == 1 and d.size == w*h:
+            d = d.reshape(h, w)
+        elif d.ndim != 2:
+            d = d.reshape(-1, 1)
+        depth_u16 = np.ascontiguousarray(d.astype(np.uint16, copy=False))
+    # rgb: ensure non-empty JPEG
+    if not rgb_jpg:
+        blank = np.zeros((h, w, 3), np.uint8)
+        ok, buf = cv2.imencode('.jpg', blank, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        rgb_jpg = buf.tobytes() if ok else b""
+    return rgb_jpg, depth_u16
 
-def _install_signal_handlers(flag: _StopFlag):
-    def handler(sig, frame):
-        print("\n[MultiStreamer2Cams] Caught signal, shutting down …")
-        flag.stop = True
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
+def _find_extrinsics(here: str, mxid: str, fallback_name: str, allow_identity: bool, tag: str) -> np.ndarray:
+    p1 = os.path.join(here, f"extrinsics_{mxid}.npz")
+    p2 = os.path.join(here, fallback_name)
+    if os.path.exists(p1):
+        M = load_extrinsics_npz(p1)
+        print(f"[Extrinsics] {tag}: {os.path.basename(p1)}")
+        return M
+    if os.path.exists(p2):
+        M = load_extrinsics_npz(p2)
+        print(f"[Extrinsics] {tag}: {os.path.basename(p2)}")
+        return M
+    if allow_identity:
+        print(f"[Extrinsics] {tag}: {os.path.basename(p1)} / {os.path.basename(p2)} MISSING → identity")
+        return np.eye(4, dtype=np.float32)
+    raise FileNotFoundError(f"Missing extrinsics for {tag}: {p1} or {p2}")
 
-# --------- Main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Two-camera RGB-D streamer (single-port, hardcoded MX IDs).")
-    ap.add_argument("--dummy", action="store_true", help="Use synthetic 2-camera source (no hardware needed)")
-    ap.add_argument("--rgb-w", type=int, default=DEFAULTS["rgb_w"])
-    ap.add_argument("--rgb-h", type=int, default=DEFAULTS["rgb_h"])
-    ap.add_argument("--fps", type=int, default=DEFAULTS["fps"])
-    ap.add_argument("--pair-tol-ms", type=float, default=DEFAULTS["pair_tol_ms"])
-    ap.add_argument("--port", type=int, default=DEFAULTS["zmq_port"], help="ZMQ TCP port (PUSH bind)")
-    ap.add_argument("--disc-port", type=int, default=DEFAULTS["discovery_port"], help="UDP discovery port")
-    ap.add_argument("--use-roi", action="store_true", default=DEFAULTS["use_roi"])
-    ap.add_argument("--roi-x0", type=int, default=DEFAULTS["roi_x0"])
-    ap.add_argument("--roi-y0", type=int, default=DEFAULTS["roi_y0"])
-    ap.add_argument("--roi-w", type=int, default=DEFAULTS["roi_w"])
-    ap.add_argument("--roi-h", type=int, default=DEFAULTS["roi_h"])
-    ap.add_argument("--ds-block", type=int, default=DEFAULTS["downsample_block"])
-    ap.add_argument("--zmin", type=float, default=DEFAULTS["z_min_m"])
-    ap.add_argument("--zmax", type=float, default=DEFAULTS["z_max_m"])
-    ap.add_argument("--cull-zmin", type=float, default=DEFAULTS["cull_zmin"])
-    ap.add_argument("--cull-zmax", type=float, default=DEFAULTS["cull_zmax"])
-    ap.add_argument("--cull-x", type=float, default=DEFAULTS["cull_x"])
-    ap.add_argument("--cull-y", type=float, default=DEFAULTS["cull_y"])
-    ap.add_argument("--jpeg-quality", type=int, default=DEFAULTS["jpeg_quality"])
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dummy", action="store_true", help="Use two dummy cameras instead of OAK devices")
+    ap.add_argument("--mx0", default=MX_ID_CAM0, help="MX ID for camera 0 (ignored in --dummy)")
+    ap.add_argument("--mx1", default=MX_ID_CAM1, help="MX ID for camera 1 (ignored in --dummy)")
+    ap.add_argument("--rgb_w", type=int, default=DEFAULTS["rgb_w"])
+    ap.add_argument("--rgb_h", type=int, default=DEFAULTS["rgb_h"])
+    ap.add_argument("--fps",   type=int, default=DEFAULTS["fps"])
+    ap.add_argument("--pair_tol_ms", type=float, default=DEFAULTS["pair_tol_ms"])
+    ap.add_argument("--zmq_port", type=int, default=DEFAULTS["zmq_port"])
+    ap.add_argument("--discovery_port", type=int, default=DEFAULTS["discovery_port"])
+    ap.add_argument("--use_roi", action="store_true", default=DEFAULTS["use_roi"])
+    ap.add_argument("--roi", nargs=4, type=int, metavar=("x0","y0","w","h"), default=None)
+    ap.add_argument("--downsample_block", type=int, default=DEFAULTS["downsample_block"])
+    ap.add_argument("--z_min_m", type=float, default=DEFAULTS["z_min_m"])
+    ap.add_argument("--z_max_m", type=float, default=DEFAULTS["z_max_m"])
+    ap.add_argument("--cull_zmin", type=float, default=DEFAULTS["cull_zmin"])
+    ap.add_argument("--cull_zmax", type=float, default=DEFAULTS["cull_zmax"])
+    ap.add_argument("--cull_x", type=float, default=DEFAULTS["cull_x"])
+    ap.add_argument("--cull_y", type=float, default=DEFAULTS["cull_y"])
+    ap.add_argument("--jpeg_quality", type=int, default=DEFAULTS["jpeg_quality"])
+    ap.add_argument("--no-preview", action="store_true", help="Disable OpenCV preview windows")
     args = ap.parse_args()
 
+    rgb_w, rgb_h, fps = args.rgb_w, args.rgb_h, args.fps
+    roi = args.roi if args.roi is not None else (DEFAULTS["roi_x0"], DEFAULTS["roi_y0"], DEFAULTS["roi_w"], DEFAULTS["roi_h"])
+    use_roi = bool(args.use_roi)
+    ds_block = int(max(1, args.downsample_block))
+    roi_off = (float(roi[0]) if use_roi else 0.0, float(roi[1]) if use_roi else 0.0)
+    cfg_scale = 1.0 / float(ds_block)
+
     print("=== MultiStreamer2Cams: configuration ===")
-    print(f"MX IDs: cam0={MX_ID_CAM0}, cam1={MX_ID_CAM1}")
-    for k in vars(args).keys():
-        if k not in ("dummy",):  # keep it short
-            pass
-    print(f"dummy={args.dummy}, rgb={args.rgb_w}x{args.rgb_h}@{args.fps}fps, pair_tol={args.pair_tol_ms}ms, ds={args.ds_block}")
+    print(f"DepthAI v2, dummy={args.dummy}, rgb={rgb_w}x{rgb_h}@{fps}, pair_tol={args.pair_tol_ms:.1f}ms, ds={ds_block}")
+    print(f"ZMQ tcp://*:{args.zmq_port}, discovery UDP :{args.discovery_port}")
+    if use_roi:
+        print(f"ROI = x0={roi[0]} y0={roi[1]} w={roi[2]} h={roi[3]} (intrinsics will be offset+scaled)")
 
-    # -------- Extrinsics (simple, from next to script) --------
-    T_wc_A = _load_T_wc_or_identity(EXTR_A, allow_identity=args.dummy, tag="Cam 0")
-    T_wc_B = _load_T_wc_or_identity(EXTR_B, allow_identity=args.dummy, tag="Cam 1")
+    # Build processing chain + actions
+    chain = build_chain(use_roi, *roi, ds_block, args.z_min_m, args.z_max_m, args.jpeg_quality)
+    cull = Culling(args.cull_zmin, args.cull_zmax, args.cull_x, args.cull_y)
+    pub  = ZMQPublishMuxAction(port=args.zmq_port, cull=cull, start_discovery_port=args.discovery_port)
 
-    # -------- Sources --------
+    # Extrinsics (row-major T_world_from_camera)
+    here = os.path.dirname(os.path.abspath(__file__))
+    T_wc_A = _find_extrinsics(here, args.mx0, "extrinsics_cam0.npz", allow_identity=args.dummy, tag="Cam 0")
+    T_wc_B = _find_extrinsics(here, args.mx1, "extrinsics_cam1.npz", allow_identity=args.dummy, tag="Cam 1")
+
+    # Sources
+    if args.dummy:
+        src = MultiDummySource(rgb_w=rgb_w, rgb_h=rgb_h, fps=fps, tol_ms=args.pair_tol_ms)
+    else:
+        src = MultiOAKSource(args.mx0, args.mx1, rgb_w=rgb_w, rgb_h=rgb_h, fps=fps, tol_ms=args.pair_tol_ms)
+
+    use_preview = not args.no_preview
+    preview = PreviewMosaic("Preview (two cameras)") if use_preview else None
+
+    frames = 0
+    t0 = time.time()
+
     try:
-        if args.dummy:
-            src = MultiDummySource(width=args.rgb_w, height=args.rgb_h, fps=args.fps, tol_ms=args.pair_tol_ms)
-            print("[INFO] Using Dummy source.")
-        else:
-            src = MultiOAKSource(
-                MX_ID_CAM0, MX_ID_CAM1,
-                tol_ms=args.pair_tol_ms,
-                rgb_w=args.rgb_w, rgb_h=args.rgb_h,
-                fps=args.fps
-            )
-            print(f"[INFO] Using OAK devices: cam0={MX_ID_CAM0}, cam1={MX_ID_CAM1}")
-    except Exception as e:
-        print(f"[ERROR] Opening source: {e}")
-        sys.exit(2)
-
-    # -------- Publisher + Preview --------
-    try:
-        pub = ZMQPublishMuxAction(port=args.port, discovery_port=args.disc_port)
-    except Exception as e:
-        print(f"[ERROR] Creating ZMQ publisher: {e}")
-        src.close()
-        sys.exit(3)
-
-    preview = PreviewAction(window_name="MultiCam Preview", zmin_m=args.zmin, zmax_m=args.zmax)
-
-    # -------- Processing chain --------
-    chain = build_chain(
-        use_roi=args.use_roi,
-        roi_x0=args.roi_x0, roi_y0=args.roi_y0, roi_w=args.roi_w, roi_h=args.roi_h,
-        downsample_block=max(1, args.ds_block),
-        z_min_m=args.zmin, z_max_m=args.zmax,
-        jpeg_quality=args.jpeg_quality
-    )
-    roi_off = (args.roi_x0, args.roi_y0) if args.use_roi else (0, 0)
-    ds_block = max(1, args.ds_block)
-    cull = Culling(zcullmin=args.cull_zmin, zcullmax=args.cull_zmax, x_cull=args.cull_x, y_cull=args.cull_y)
-
-    # -------- Main loop --------
-    flag = _StopFlag()
-    _install_signal_handlers(flag)
-
-    fps_pairs = 0
-    t_last = time.time()
-
-    print("\nMultiStreamer2Cams: streaming… (Ctrl+C or 'q' in preview to quit)")
-    try:
-        while not flag.stop:
-            pair = src.try_pair()
+        while True:
+            pair = src.try_get_pair()
             if pair is None:
-                if preview._last_key == ord('q'):
-                    break
                 time.sleep(0.001)
                 continue
 
-            # === A ===
-            rgbA_jpg, depthA = chain.process(pair.A.frame.rgb, pair.A.frame.depth)
-            hA, wA = depthA.shape[:2]
-            tsA_us = int(pair.A.frame.ts_host_s * 1e6)
+            # Cam A
+            rgbA, depthA = pair.A.frame.rgb, pair.A.frame.depth
+            rgbA_jpg, depthA_ds = chain.process(rgbA, depthA)
+            hA, wA = depthA_ds.shape[:2] if depthA_ds is not None else (pair.A.frame.h, pair.A.frame.w)
+            rgbA_jpg, depthA_ds = _normalize(rgbA_jpg, depthA_ds, wA, hA)
 
-            # === B ===
-            rgbB_jpg, depthB = chain.process(pair.B.frame.rgb, pair.B.frame.depth)
-            hB, wB = depthB.shape[:2]
-            tsB_us = int(pair.B.frame.ts_host_s * 1e6)
+            # Cam B
+            rgbB, depthB = pair.B.frame.rgb, pair.B.frame.depth
+            rgbB_jpg, depthB_ds = chain.process(rgbB, depthB)
+            hB, wB = depthB_ds.shape[:2] if depthB_ds is not None else (pair.B.frame.h, pair.B.frame.w)
+            rgbB_jpg, depthB_ds = _normalize(rgbB_jpg, depthB_ds, wB, hB)
 
-            # Preview
-            quitA = preview.show(0, rgbA_jpg, depthA, info_text=f"Δt≈{pair.dt_ms:.1f} ms")
-            quitB = preview.show(1, rgbB_jpg, depthB, info_text=None)
-            if quitA or quitB:
-                break
+            if use_preview and preview is not None:
+                quitA = preview.show(0, rgbA_jpg, depthA_ds, text=f"Cam 0  {wA}x{hA}", size=(wA, hA))
+                quitB = preview.show(1, rgbB_jpg, depthB_ds, text=f"Cam 1  {wB}x{hB}   Δt={pair.dt_ms:.1f} ms", size=(wB, hB))
+                if quitA or quitB:
+                    break
 
-            # Publish (two messages per pair on one port)
+            # Publish two frames on the same port
             pub.send_frame(
                 cam_id=0, width=wA, height=hA,
-                cfg_full=pair.A.intr, cull=cull,
-                pose_4x4=T_wc_A, timestamp_us=tsA_us,
-                rgb_jpeg_bytes=rgbA_jpg, depth_u16=depthA,
-                ds_block=ds_block, roi_off=roi_off
+                cfg_full=pair.A.intr, cfg_scale=cfg_scale, roi_off=roi_off,
+                rgb_jpeg_bytes=rgbA_jpg, depth_u16=depthA_ds,
+                pose_4x4=T_wc_A
             )
             pub.send_frame(
                 cam_id=1, width=wB, height=hB,
-                cfg_full=pair.B.intr, cull=cull,
-                pose_4x4=T_wc_B, timestamp_us=tsB_us,
-                rgb_jpeg_bytes=rgbB_jpg, depth_u16=depthB,
-                ds_block=ds_block, roi_off=roi_off
+                cfg_full=pair.B.intr, cfg_scale=cfg_scale, roi_off=roi_off,
+                rgb_jpeg_bytes=rgbB_jpg, depth_u16=depthB_ds,
+                pose_4x4=T_wc_B
             )
 
-            # Simple throughput log
-            fps_pairs += 1
-            now = time.time()
-            if now - t_last >= 1.0:
-                print(f"[Pairs/s] {fps_pairs} | Δt~{pair.dt_ms:.1f} ms | A {wA}x{hA}, B {wB}x{hB}")
-                fps_pairs = 0
-                t_last = now
+            frames += 2
+            if frames % 60 == 0:
+                dt = time.time() - t0
+                print(f"[SENDER] {frames/dt:.1f} fps (2 cams) — A:{wA}x{hA} B:{wB}x{hB}")
 
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         print(f"[ERROR] Runtime: {e}")
 
     finally:
-        try: preview.close()
+        try:
+            if preview: preview.close()
         except: pass
         try: pub.close()
         except: pass

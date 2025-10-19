@@ -10,174 +10,199 @@ import zmq
 
 from Datasources import CameraConfig, Culling, scale_intrinsics
 
+# -------------------- UDP discovery server --------------------
 
 class UdpDiscoveryServer:
     """Responds to UDP broadcasts so the Quest/Unity can discover the ZMQ endpoint."""
     def __init__(self, port: int = 5556, response: bytes = b"ZMQ_SERVER_HERE"):
-        self.port = port
+        self.port = int(port)
         self.response = response
-        self._th: Optional[threading.Thread] = None
         self._stop = False
+        self._th: Optional[threading.Thread] = None
 
     def start(self):
         def loop():
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("", self.port))
+            s.settimeout(0.25)
             while not self._stop:
                 try:
                     data, addr = s.recvfrom(1024)
                     if data == b"DISCOVER_ZMQ_SERVER":
                         s.sendto(self.response, addr)
+                except socket.timeout:
+                    continue
                 except Exception:
-                    break
+                    continue
             s.close()
-
         self._th = threading.Thread(target=loop, daemon=True)
         self._th.start()
 
     def stop(self):
         self._stop = True
+        if self._th: self._th.join(timeout=0.2)
 
+# -------------------- ZMQ single-port multiplex publisher --------------------
 
 class ZMQPublishMuxAction:
     """
-    Single PUSH socket (one port) that carries frames for multiple cameras.
-
-    Packet layout (little-endian):
-      uint8  cam_id
-      uint8  flags (0)
-      uint16 reserved (0)
-      uint32 width, height
-      float  fx, fy, cx, cy
-      float  zmin, zmax, xCull, yCull
-      float  pose[16]  // row-major 4x4: world_from_camera
-      uint64 timestamp_us
-      uint32 rgb_len
-      uint8  rgb_jpeg[rgb_len]
-      uint32 depth_len
-      uint8  depth_z16[depth_len]
+    Packet layout per frame (same head as single-cam; then pose + cam_id):
+      uint32  width
+      uint32  height
+      uint32  rgb_len
+      bytes   rgb_jpeg[rgb_len]
+      uint32  depth_len
+      bytes   depth_u16[depth_len]     // mm, width*height*2
+      float32 fx, fy, cx, cy
+      float32 zCullMin, zCullMax
+      float32 xCull, yCull
+      float32 pose_4x4[16]             // row-major T_world_from_camera
+      uint8   cam_id
     """
-    def __init__(self, port: int = 5555, discovery_port: int = 5556):
+    def __init__(self, port: int, cull: Culling, start_discovery_port: Optional[int] = 5556):
+        self.cull = cull
         self.ctx = zmq.Context.instance()
         self.sock = self.ctx.socket(zmq.PUSH)
-        # ------- IMPORTANT: allow two back-to-back frames (cam0, cam1) without dropping -------
-        self.sock.setsockopt(zmq.SNDHWM, 8)   # more headroom than 1; keeps latency low but avoids constant drops
-        self.sock.setsockopt(zmq.LINGER, 0)   # don't stall on shutdown
-        self.sock.bind(f"tcp://*:{port}")
-        self.discovery = UdpDiscoveryServer(discovery_port)
-        self.discovery.start()
-        self._drops = [0, 0]  # per-cam drop counters
-        print(f"[ZMQ] PUSH bound tcp://*:{port}, UDP discovery on {discovery_port} | SNDHWM=8, LINGER=0")
+        self.sock.setsockopt(zmq.SNDHWM, 8)
+        self.sock.bind(f"tcp://*:{int(port)}")
+
+        self.discovery = None
+        if start_discovery_port is not None and start_discovery_port > 0:
+            self.discovery = UdpDiscoveryServer(port=start_discovery_port)
+            self.discovery.start()
+
+    @staticmethod
+    def _pack_header_and_payload(width: int, height: int,
+                                 rgb_jpeg: bytes, depth_u16: np.ndarray,
+                                 intr: CameraConfig, cull: Culling,
+                                 pose_4x4: np.ndarray, cam_id: int) -> bytes:
+        if depth_u16 is None:
+            depth_u16 = np.zeros((height, width), np.uint16)
+        depth_u16 = np.ascontiguousarray(depth_u16.astype(np.uint16, copy=False))
+        depth_bytes = depth_u16.tobytes(order='C')
+
+        rgb_len = len(rgb_jpeg)
+        depth_len = len(depth_bytes)
+
+        assert pose_4x4.shape == (4, 4)
+        pose = pose_4x4.astype(np.float32).reshape(-1)  # row-major 16
+
+        parts = [
+            struct.pack('<2I', width, height),
+            struct.pack('<I', rgb_len), rgb_jpeg,
+            struct.pack('<I', depth_len), depth_bytes,
+            struct.pack('<4f', float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)),
+            struct.pack('<4f', float(cull.zcullmin), float(cull.zcullmax), float(cull.x_cull), float(cull.y_cull)),
+            struct.pack('<16f', *pose),
+            struct.pack('<B', int(cam_id) & 0xFF),
+        ]
+        return b''.join(parts)
+
+    def send_frame(self, *, cam_id: int, width: int, height: int,
+                   cfg_full: CameraConfig, cfg_scale: float, roi_off: Tuple[float, float],
+                   rgb_jpeg_bytes: bytes, depth_u16: np.ndarray,
+                   pose_4x4: np.ndarray):
+        intr_eff = scale_intrinsics(cfg_full, cfg_scale, roi_off=roi_off)
+        pkt = self._pack_header_and_payload(width, height,
+                                            rgb_jpeg_bytes, depth_u16,
+                                            intr_eff, self.cull, pose_4x4, cam_id)
+        try:
+            self.sock.send(pkt, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            pass
 
     def close(self):
         try:
-            self.sock.close(0)
-        finally:
-            try:
-                self.discovery.stop()
-            except Exception:
-                pass
-
-    def send_frame(
-        self,
-        cam_id: int,
-        width: int,
-        height: int,
-        cfg_full: CameraConfig,
-        cull: Culling,
-        pose_4x4: np.ndarray,
-        timestamp_us: int,
-        rgb_jpeg_bytes: bytes,
-        depth_u16: np.ndarray,
-        ds_block: int = 1,
-        roi_off: Tuple[int, int] = (0, 0),
-    ):
-        # Scale intrinsics for downsample and ROI (if any)
-        scale = 1.0 / float(ds_block) if ds_block > 1 else 1.0
-        cfg = scale_intrinsics(cfg_full, scale, roi_off)
-
-        # Header
-        header = (
-            struct.pack("<BBH", cam_id, 0, 0)
-            + struct.pack("<2I", width, height)
-            + struct.pack("<4f", cfg.fx, cfg.fy, cfg.cx, cfg.cy)
-            + struct.pack("<4f", cull.zcullmin, cull.zcullmax, cull.x_cull, cull.y_cull)
-            + struct.pack("<16f", *pose_4x4.astype(np.float32).reshape(-1).tolist())
-            + struct.pack("<Q", int(timestamp_us))
-        )
-
-        # Payloads
-        rgb_bytes = rgb_jpeg_bytes if isinstance(rgb_jpeg_bytes, (bytes, bytearray)) else bytes(rgb_jpeg_bytes)
-        depth_bytes = depth_u16.astype(np.uint16, copy=False).tobytes()
-
-        packet = (
-            header
-            + struct.pack("<I", len(rgb_bytes))
-            + rgb_bytes
-            + struct.pack("<I", len(depth_bytes))
-            + depth_bytes
-        )
-
+            if self.discovery: self.discovery.stop()
+        except: pass
         try:
-            self.sock.send(packet, zmq.NOBLOCK)
-        except zmq.Again:
-            # drop if consumer is slow — keeps latency low
-            if 0 <= cam_id < 2:
-                self._drops[cam_id] += 1
-                if (self._drops[cam_id] % 30) == 1:
-                    print(f"[ZMQ] DROP cam{cam_id}: total={self._drops[cam_id]} (consider raising SNDHWM)")
-            else:
-                print("[ZMQ] DROP (unknown cam id)")
+            self.sock.close(0)
+        except: pass
 
-class PreviewAction:
-    """
-    OpenCV preview for 2-camera processed outputs.
-    Call show(cam_id, rgb_jpeg_bytes, depth_u16, info_text) for A (0) and B (1).
-    It renders a mosaic (A row, B row) with RGB | Depth side-by-side.
-    """
-    def __init__(self, window_name: str = "MultiCam Preview", zmin_m: float = 0.25, zmax_m: float = 4.0):
-        self.win = window_name
-        self.zmin = float(zmin_m)
-        self.zmax = float(zmax_m)
-        self._rows = {0: None, 1: None}  # cam_id -> row image
+# -------------------- Hardened preview (2× cams) --------------------
+
+class PreviewMosaic:
+    def __init__(self, win_name="Preview 2×"):
+        self.win = str(win_name)
+        self._rows = [None, None]
         self._last_key = -1
+        self._ver = "PreviewMosaic v2.2"
         cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
+        print(f"[INFO] {self._ver} ready")
 
-    def _decode_rgb(self, jpg_bytes: bytes) -> np.ndarray:
-        if isinstance(jpg_bytes, (bytes, bytearray)) and len(jpg_bytes) > 0:
-            arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is not None:
-                return img
-        # fallback
-        return np.zeros((1, 1, 3), np.uint8)
+    @staticmethod
+    def _decode_rgb(jpg_bytes: bytes) -> np.ndarray:
+        if not jpg_bytes:
+            return np.zeros((240, 320, 3), np.uint8)
+        arr = np.frombuffer(jpg_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
+        if img is None:
+            img = np.zeros((240, 320, 3), np.uint8)
+        return img
 
-    def _depth_vis(self, depth_u16: np.ndarray) -> np.ndarray:
-        d = depth_u16.astype(np.float32)
-        d[d <= 0] = np.nan
-        zmin = self.zmin * 1000.0
-        zmax = self.zmax * 1000.0
-        d = np.clip((d - zmin) / (zmax - zmin), 0.0, 1.0)
-        d = (255.0 * (1.0 - d)).astype(np.uint8)  # near=bright
-        return cv2.applyColorMap(d, cv2.COLORMAP_TURBO)
+    @staticmethod
+    def _reshape_depth_to_hw(depth_any, w: int, h: int) -> np.ndarray:
+        """Force uint16 depth of shape (h,w) no matter what comes in."""
+        a = np.asarray(depth_any)
+        if a.ndim == 2 and a.shape == (h, w):
+            d = a
+        else:
+            a = np.squeeze(a)
+            if a.ndim == 1:
+                if a.size == w * h:
+                    d = a.reshape(h, w)
+                else:
+                    flat = a.reshape(-1)
+                    need = w * h
+                    if flat.size < need:
+                        pad = np.pad(flat, (0, need - flat.size), mode='edge')
+                        d = pad.reshape(h, w)
+                    else:
+                        d = flat[:need].reshape(h, w)
+            elif a.ndim == 2:
+                d = cv2.resize(a.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint16)
+            else:
+                flat = a.reshape(-1)
+                need = w * h
+                if flat.size < need:
+                    flat = np.pad(flat, (0, need - flat.size), mode='edge')
+                d = flat[:need].reshape(h, w)
+        return np.ascontiguousarray(d.astype(np.uint16, copy=False))
 
-    def show(self, cam_id: int, rgb_jpg: bytes, depth_u16: np.ndarray, info_text: Optional[str] = None) -> bool:
+    def _depth_vis(self, depth_u16: np.ndarray, w: int, h: int) -> np.ndarray:
+        d = self._reshape_depth_to_hw(depth_u16, w, h)
+        d_ = d.copy()
+        d_[d_ == 0] = 65535
+        d_ = np.clip(d_, 200, 6000)
+        d8 = ((d_ - 200) * (255.0 / (6000 - 200))).astype(np.uint8)
+        vis = cv2.applyColorMap(d8, cv2.COLORMAP_JET)  # (h,w,3)
+        return vis
+
+    def show(self, cam_id: int, rgb_jpg: bytes, depth_u16: np.ndarray, text: str = None, size=None) -> bool:
+        """
+        size MUST be (w,h) of the processed frame. We force both RGB & Depth to (h,w,3).
+        """
+        if size is None:
+            rgb_guess = self._decode_rgb(rgb_jpg)
+            size = (rgb_guess.shape[1], rgb_guess.shape[0])
+        w, h = int(size[0]), int(size[1])
+
         rgb = self._decode_rgb(rgb_jpg)
-        dep = self._depth_vis(depth_u16)
-        H = max(rgb.shape[0], dep.shape[0])
-        rgb = cv2.resize(rgb, (dep.shape[1], dep.shape[0]), interpolation=cv2.INTER_LINEAR)
-        row = np.hstack([rgb, dep])
-        if info_text:
-            cv2.putText(row, info_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+        if rgb.shape[0] != h or rgb.shape[1] != w:
+            rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+        dep = self._depth_vis(depth_u16, w, h)
+
+        row = cv2.hconcat([rgb, dep])
+        if text:
+            cv2.putText(row, text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
         self._rows[cam_id] = row
 
         if self._rows[0] is not None and self._rows[1] is not None:
-            # stack rows
-            w = max(self._rows[0].shape[1], self._rows[1].shape[1])
-            r0 = cv2.resize(self._rows[0], (w, self._rows[0].shape[0]))
-            r1 = cv2.resize(self._rows[1], (w, self._rows[1].shape[0]))
-            mosaic = np.vstack([r0, r1])
+            wmax = max(self._rows[0].shape[1], self._rows[1].shape[1])
+            r0 = cv2.resize(self._rows[0], (wmax, self._rows[0].shape[0]))
+            r1 = cv2.resize(self._rows[1], (wmax, self._rows[1].shape[0]))
+            mosaic = cv2.vconcat([r0, r1])
             cv2.imshow(self.win, mosaic)
 
         self._last_key = cv2.waitKey(1) & 0xFF
@@ -186,5 +211,5 @@ class PreviewAction:
     def close(self):
         try:
             cv2.destroyWindow(self.win)
-        except Exception:
+        except:
             pass

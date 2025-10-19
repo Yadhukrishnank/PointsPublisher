@@ -1,13 +1,12 @@
-# Source.py
+# Source.py  (DepthAI v2, two OAKs, plus two-camera dummy)
 from dataclasses import dataclass
 from collections import deque
 import time
 import numpy as np
 import cv2
 
-# DepthAI is optional (dummy will work even if it's missing)
 try:
-    import depthai as dai
+    import depthai as dai  # DepthAI v2
 except Exception:
     dai = None
 
@@ -17,9 +16,9 @@ from Datasources import CameraConfig
 
 @dataclass
 class Frame:
-    rgb: np.ndarray           # HxWx3 uint8 (BGR, aligned)
-    depth: np.ndarray         # HxW uint16 (mm)
-    ts_host_s: float          # host timestamp seconds
+    rgb: np.ndarray          # HxWx3 (BGR)
+    depth: np.ndarray        # HxW   (uint16 mm)
+    ts_host_s: float         # host timestamp (for cross-device pairing)
     w: int
     h: int
 
@@ -35,109 +34,145 @@ class PairedBundle:
     B: CamBundle
     dt_ms: float
 
-# -------------------- OAK devices --------------------
+# -------------------- Single OAK (DepthAI v2) --------------------
 
 class OAKSingleDevice:
-    """One OAK: RGB (preview) + depth aligned to RGB size."""
+    """
+    One device: ColorCamera + Mono L/R + StereoDepth aligned to CAM_A (color).
+    Exposes color intrinsics at (rgb_w, rgb_h).
+    """
     def __init__(self, mx_id: str, rgb_w=1280, rgb_h=720, fps=30):
         if dai is None:
-            raise RuntimeError("depthai not available; install 'depthai' or use the --dummy source.")
-        self.mx = mx_id; self.rgb_w=rgb_w; self.rgb_h=rgb_h; self.fps=fps
+            raise RuntimeError("depthai not installed. Please install DepthAI v2.")
+        self.mx = mx_id
+        self.rgb_w = int(rgb_w)
+        self.rgb_h = int(rgb_h)
+        self.fps   = int(fps)
+
         self.dev = dai.Device(dai.DeviceInfo(mx_id))
         self.pipeline = self._build_pipeline()
         self.dev.startPipeline(self.pipeline)
+
         self.qRgb = self.dev.getOutputQueue("rgb",   maxSize=4, blocking=False)
         self.qDep = self.dev.getOutputQueue("depth", maxSize=4, blocking=False)
-        self._latest_rgb = None
-        # intrinsics aligned to RGB output size
-        calib = self.dev.readCalibration()
-        K = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, self.rgb_w, self.rgb_h)
-        self.intr = CameraConfig(fx=K[0][0], fy=K[1][1], cx=K[0][2], cy=K[1][2])
+
+        self._intr = self._get_color_intrinsics()
 
     def _build_pipeline(self):
         p = dai.Pipeline()
-        camRgb = p.createColorCamera()
-        camRgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-        camRgb.setFps(self.fps)
-        camRgb.setPreviewSize(self.rgb_w, self.rgb_h)
-        camRgb.setInterleaved(False)
 
-        monoL = p.createMonoCamera(); monoR = p.createMonoCamera()
-        monoL.setBoardSocket(dai.CameraBoardSocket.CAM_B)
-        monoR.setBoardSocket(dai.CameraBoardSocket.CAM_C)
+        # Color
+        cam = p.create(dai.node.ColorCamera)
+        cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+        cam.setFps(self.fps)
+        cam.setVideoSize(self.rgb_w, self.rgb_h)
+        cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+
+        # Mono + StereoDepth
+        monoL = p.create(dai.node.MonoCamera)
+        monoR = p.create(dai.node.MonoCamera)
+        monoL.setBoardSocket(dai.CameraBoardSocket.LEFT)
+        monoR.setBoardSocket(dai.CameraBoardSocket.RIGHT)
         monoL.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         monoR.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        monoL.setFps(self.fps)
+        monoR.setFps(self.fps)
 
-        stereo = p.createStereoDepth()
-        stereo.initialConfig.setConfidenceThreshold(180)
-        stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_5x5)
-        stereo.setLeftRightCheck(True); stereo.setExtendedDisparity(True); stereo.setSubpixel(True)
-        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
-        stereo.setOutputSize(self.rgb_w, self.rgb_h)
+        stereo = p.create(dai.node.StereoDepth)
+        stereo.setConfidenceThreshold(200)
+        stereo.setLeftRightCheck(True)
+        stereo.setSubpixel(True)
+        stereo.setRectifyEdgeFillColor(0)
+        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)  # align to color
 
-        monoL.out.link(stereo.left); monoR.out.link(stereo.right)
+        monoL.out.link(stereo.left)
+        monoR.out.link(stereo.right)
 
-        xRgb = p.createXLinkOut(); xRgb.setStreamName("rgb");  camRgb.preview.link(xRgb.input)
-        xDep = p.createXLinkOut(); xDep.setStreamName("depth"); stereo.depth.link(xDep.input)
+        # Outputs
+        xout_rgb = p.create(dai.node.XLinkOut)
+        xout_rgb.setStreamName("rgb")
+        cam.video.link(xout_rgb.input)
+
+        xout_depth = p.create(dai.node.XLinkOut)
+        xout_depth.setStreamName("depth")
+        stereo.depth.link(xout_depth.input)
+
         return p
 
-    def try_get(self):
+    def _get_color_intrinsics(self) -> CameraConfig:
+        calib = self.dev.readCalibration()
+        K = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, self.rgb_w, self.rgb_h)
+        fx = float(K[0][0]); fy = float(K[1][1]); cx = float(K[0][2]); cy = float(K[1][2])
+        return CameraConfig(fx=fx, fy=fy, cx=cx, cy=cy)
+
+    def try_get(self) -> Frame | None:
         fRgb = self.qRgb.tryGet()
-        if fRgb is not None:
-            self._latest_rgb = fRgb.getCvFrame()
         fDep = self.qDep.tryGet()
-        if fDep is None: return None
-        depth = fDep.getFrame()  # uint16 mm
-        ts = float(fDep.getTimestamp().total_seconds())
-        rgb = self._latest_rgb if self._latest_rgb is not None else np.zeros((self.rgb_h, self.rgb_w, 3), np.uint8)
-        H,W = depth.shape[:2]
-        if (rgb.shape[0], rgb.shape[1]) != (H,W):
-            rgb = cv2.resize(rgb, (W,H), interpolation=cv2.INTER_LINEAR)
-        return Frame(rgb=rgb, depth=depth, ts_host_s=ts, w=W, h=H)
+        if fRgb is None or fDep is None:
+            return None
+        rgb = fRgb.getCvFrame()   # BGR
+        depth = fDep.getFrame()   # uint16 (mm), aligned to color
+        if rgb is None or depth is None:
+            return None
+        if depth.shape[:2] != rgb.shape[:2]:
+            depth = cv2.resize(depth, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+        ts = time.time()  # host time for pairing across devices
+        return Frame(rgb=rgb, depth=depth, ts_host_s=ts, w=rgb.shape[1], h=rgb.shape[0])
+
+    @property
+    def intr(self) -> CameraConfig:
+        return self._intr
 
     def close(self):
-        try: self.dev.close()
+        try:
+            self.qRgb.close(); self.qDep.close()
+        except: pass
+        try:
+            self.dev.close()
         except: pass
 
+# -------------------- Two-device wrapper --------------------
+
 class MultiOAKSource:
-    """Pairs two OAK devices by host timestamp with tolerance."""
-    def __init__(self, mx_a: str, mx_b: str, tol_ms: float = 25.0, **kwargs):
-        self.A = OAKSingleDevice(mx_a, **kwargs)
-        self.B = OAKSingleDevice(mx_b, **kwargs)
-        self.tol = tol_ms / 1000.0
+    def __init__(self, mx_id_A: str, mx_id_B: str, rgb_w=1280, rgb_h=720, fps=30, tol_ms=25.0):
+        self.A = OAKSingleDevice(mx_id_A, rgb_w, rgb_h, fps)
+        self.B = OAKSingleDevice(mx_id_B, rgb_w, rgb_h, fps)
+        self.tol = float(tol_ms) / 1000.0
         self.bufA, self.bufB = deque(maxlen=120), deque(maxlen=120)
 
     @staticmethod
     def _best_match(ts, dq):
-        if not dq: return None, None, 1e9
+        if not dq: return (None, None, 1e9)
         best_i, best_dt = None, 1e9
-        for i,(t,_) in enumerate(dq):
+        for i, (t, fr) in enumerate(dq):
             dt = abs(ts - t)
             if dt < best_dt: best_dt, best_i = dt, i
         return (best_i, dq[best_i][1], best_dt) if best_i is not None else (None, None, 1e9)
 
-    def try_pair(self):
+    def try_get_pair(self) -> PairedBundle | None:
         fA = self.A.try_get()
+        fB = self.B.try_get()
+
         if fA is not None:
-            i, fb, dt = self._best_match(fA.ts_host_s, self.bufB)
-            if i is not None and dt <= self.tol:
-                tsb, fB = self.bufB[i]; del self.bufB[i]
+            j, fb, dt = self._best_match(fA.ts_host_s, self.bufB)
+            if j is not None and dt <= self.tol:
+                _, fB2 = self.bufB[j]; del self.bufB[j]
                 return PairedBundle(
                     A=CamBundle(0, fA, self.A.intr),
-                    B=CamBundle(1, fB, self.B.intr),
-                    dt_ms = dt*1000.0
+                    B=CamBundle(1, fB2, self.B.intr),
+                    dt_ms=dt*1000.0
                 )
             self.bufA.append((fA.ts_host_s, fA))
 
-        fB = self.B.try_get()
         if fB is not None:
             i, fa, dt = self._best_match(fB.ts_host_s, self.bufA)
             if i is not None and dt <= self.tol:
-                tsa, fA = self.bufA[i]; del self.bufA[i]
+                _, fA2 = self.bufA[i]; del self.bufA[i]
                 return PairedBundle(
-                    A=CamBundle(0, fA, self.A.intr),
-                    B=CamBundle(1, fB, self.B.intr),
-                    dt_ms = dt*1000.0
+                    A=CamBundle(0, fA2, self.A.intr),
+                    B=CamBundle(1, fB,  self.B.intr),
+                    dt_ms=dt*1000.0
                 )
             self.bufB.append((fB.ts_host_s, fB))
         return None
@@ -145,147 +180,90 @@ class MultiOAKSource:
     def close(self):
         self.A.close(); self.B.close()
 
-# -------------------- Dummy devices (tinted so you can tell A/B apart) --------------------
-
-class DummySingleDevice:
-    """
-    Synthetic RGB-D generator with a base gradient RGB, optional tint, border & label,
-    and a sloped/animated depth plane. Timestamp advances at 'fps'.
-    """
-    def __init__(self,
-                 width=640, height=360, fps=30,
-                 fx=591.4, fy=591.4,
-                 # BGR tint (OpenCV uses BGR)
-                 tint_bgr=(255, 200, 0),    # cyan-ish
-                 tint_alpha=0.35,
-                 label_text=None,
-                 border_px=8):
-        self.w, self.h = int(width), int(height)
-        self.fps = fps
-        self.t = 0
-        self.dt = 1.0 / float(max(1, fps))
-        self.next_ts = time.time()
-        self.intr = CameraConfig(fx=fx, fy=fy, cx=self.w/2.0, cy=self.h/2.0)
-
-        self.tint_bgr = np.array(tint_bgr, dtype=np.uint8)
-        self.tint_alpha = float(np.clip(tint_alpha, 0.0, 1.0))
-        self.label_text = label_text
-        self.border_px = int(max(0, border_px))
-
-        # Precompute ramps for speed
-        xs = np.linspace(0, 1, self.w, dtype=np.float32)[None, :]
-        ys = np.linspace(0, 1, self.h, dtype=np.float32)[:, None]
-
-        base = np.zeros((self.h, self.w, 3), np.float32)
-        base[..., 0] = xs                               # B
-        base[..., 1] = ys                               # G
-        base[..., 2] = 0.25 + 0.5 * (xs * ys)           # R
-        self.base_rgb = np.clip(base * 255.0, 0, 255).astype(np.uint8)
-
-        # Depth base plane (mm); add small wobble
-        self.depth_base = ((0.80 + 1.70 * (0.25 * xs + 0.75 * ys)) * 1000.0).astype(np.uint16)  # 0.8..2.5 m
-        self.depth_base = self.depth_base.reshape(self.h, self.w)
-
-        # Border mask
-        if self.border_px > 0:
-            m = np.zeros((self.h, self.w), np.uint8)
-            m[:self.border_px, :] = 1
-            m[-self.border_px:, :] = 1
-            m[:, :self.border_px] = 1
-            m[:, -self.border_px:] = 1
-            self.border_mask = m.astype(bool)
-        else:
-            self.border_mask = None
-
-    def _apply_tint(self, img_bgr: np.ndarray) -> np.ndarray:
-        if self.tint_alpha <= 0.0001:
-            return img_bgr
-        # cv2.addWeighted handles rounding/saturation; we blend a solid tint layer
-        return cv2.addWeighted(img_bgr, 1.0 - self.tint_alpha,
-                               np.full_like(img_bgr, self.tint_bgr, dtype=np.uint8),
-                               self.tint_alpha, 0.0)
-
-    def _decorate(self, img_bgr: np.ndarray):
-        if self.border_mask is not None:
-            img_bgr[self.border_mask] = self.tint_bgr
-        if self.label_text:
-            cv2.putText(img_bgr, self.label_text, (18, 42),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, tuple(int(x) for x in self.tint_bgr),
-                        thickness=3, lineType=cv2.LINE_AA)
-
-    def try_get(self):
-        # RGB: base gradient + subtle animation
-        rgb = self.base_rgb.copy()
-        # small time-based shift in G channel so frames aren't static
-        rgb[..., 1] = (rgb[..., 1].astype(np.int32) + (self.t % 255)).clip(0, 255).astype(np.uint8)
-        # Apply tint & decorations
-        rgb = self._apply_tint(rgb)
-        self._decorate(rgb)
-
-        # Depth: base plane + gentle wobble (in mm)
-        wobble = int(40 * np.sin(self.t * 0.15))  # +/- 40 mm
-        depth = (self.depth_base.astype(np.int32) + wobble).clip(0, 65535).astype(np.uint16)
-
-        ts = self.next_ts
-        self.t += 1
-        self.next_ts += self.dt
-        return Frame(rgb=rgb, depth=depth, ts_host_s=ts, w=self.w, h=self.h)
-
-    def close(self): pass
+# -------------------- Two-camera dummy --------------------
 
 class MultiDummySource:
     """
-    Two synthetic cameras A/B, paired by host timestamp (like MultiOAKSource),
-    with distinguishable RGB streams (tints, borders, labels).
+    Two synthetic cameras that mimic real devices (for bandwidth / Unity testing).
     """
-    def __init__(self, width=640, height=360, fps=30, tol_ms=25.0):
-        # Cam 0 = cyan, Cam 1 = magenta (BGR tuples)
-        tintA = (255, 200, 0)   # cyan-ish in BGR
-        tintB = (255, 0, 255)   # magenta in BGR
+    def __init__(self, rgb_w=1280, rgb_h=720, fps=30, tol_ms=25.0):
+        self.w, self.h, self.fps = int(rgb_w), int(rgb_h), int(fps)
+        self.dt = 1.0 / max(1, self.fps)
+        now = time.time()
+        self.next_ts_A = now + 0.01
+        self.next_ts_B = now + 0.015
+        self.tol = float(tol_ms) / 1000.0
+        fx = fy = 900.0
+        cx, cy = self.w * 0.5, self.h * 0.5
+        self.intrA = CameraConfig(fx, fy, cx, cy)
+        self.intrB = CameraConfig(fx, fy, cx, cy)
+        self.bufA, self.bufB = deque(maxlen=60), deque(maxlen=60)
+        
+    def _gen_rgb(self, phase: float) -> np.ndarray:
+        """
+        Return HxWx3 BGR uint8 image with all channels having shape (h, w).
+        Previously we had (h,w), (h,1), (1,w) which breaks np.dstack.
+        """
+        h, w = self.h, self.w
 
-        self.A = DummySingleDevice(width, height, fps, tint_bgr=tintA, tint_alpha=0.35, label_text="CAM 0", border_px=8)
-        self.B = DummySingleDevice(width, height, fps, tint_bgr=tintB, tint_alpha=0.35, label_text="CAM 1", border_px=8)
+        # R channel: horizontal gradient (0..255 across width)
+        rx = np.linspace(0, 255, w, dtype=np.uint8)
+        r = np.tile(rx, (h, 1))  # (h, w)
 
-        # Introduce a slight phase to B so pairing logic is exercised
-        self.B.next_ts += 0.005
+        # G channel: vertical gradient (0..255 across height)
+        gy = np.linspace(0, 255, h, dtype=np.uint8)
+        g = np.tile(gy.reshape(h, 1), (1, w))  # (h, w)
 
-        self.tol = tol_ms / 1000.0
-        self.bufA, self.bufB = deque(maxlen=120), deque(maxlen=120)
+        # B channel: time-varying solid
+        b_val = int((0.5 + 0.5 * np.sin(phase)) * 255) & 255
+        b = np.full((h, w), b_val, dtype=np.uint8)  # (h, w)
 
-    @staticmethod
-    def _best_match(ts, dq):
-        if not dq: return None, None, 1e9
-        best_i, best_dt = None, 1e9
-        for i,(t,_) in enumerate(dq):
-            dt = abs(ts - t)
-            if dt < best_dt: best_dt, best_i = dt, i
-        return (best_i, dq[best_i][1], best_dt) if best_i is not None else (None, None, 1e9)
+        # BGR
+        img = np.dstack([b, g, r]).astype(np.uint8, copy=False)  # (h, w, 3)
+        return img
 
-    def try_pair(self):
-        fA = self.A.try_get()
+
+    def _gen_depth(self, z0_mm: int) -> np.ndarray:
+        xv = np.linspace(0, 1, self.w, dtype=np.float32)
+        yv = np.linspace(0, 1, self.h, dtype=np.float32)[:, None]
+        z = z0_mm + 800.0*xv + 400.0*yv
+        return z.astype(np.uint16)
+
+    def _emit_one(self, cam: int) -> Frame:
+        now = time.time()
+        if cam == 0:
+            self.next_ts_A = max(self.next_ts_A, now) + self.dt
+            ts = self.next_ts_A
+            rgb = self._gen_rgb(phase=ts*2.0)
+            depth = self._gen_depth(1200)
+        else:
+            self.next_ts_B = max(self.next_ts_B, now) + self.dt
+            ts = self.next_ts_B
+            rgb = self._gen_rgb(phase=ts*2.0+1.0)
+            depth = self._gen_depth(1400)
+        return Frame(rgb=rgb, depth=depth, ts_host_s=ts, w=self.w, h=self.h)
+
+    def try_get_pair(self) -> PairedBundle | None:
+        fA = self._emit_one(0) if (time.time() >= self.next_ts_A) else None
+        fB = self._emit_one(1) if (time.time() >= self.next_ts_B) else None
         if fA is not None:
-            i, fb, dt = self._best_match(fA.ts_host_s, self.bufB)
-            if i is not None and dt <= self.tol:
-                tsb, fB = self.bufB[i]; del self.bufB[i]
-                return PairedBundle(
-                    A=CamBundle(0, fA, self.A.intr),
-                    B=CamBundle(1, fB, self.B.intr),
-                    dt_ms=dt*1000.0
-                )
             self.bufA.append((fA.ts_host_s, fA))
-
-        fB = self.B.try_get()
         if fB is not None:
-            i, fa, dt = self._best_match(fB.ts_host_s, self.bufA)
-            if i is not None and dt <= self.tol:
-                tsa, fA = self.bufA[i]; del self.bufA[i]
+            self.bufB.append((fB.ts_host_s, fB))
+        if self.bufA and self.bufB:
+            ta, fa = self.bufA[0]
+            i, fb, dt = 0, None, 1e9
+            for j, (tb, gb) in enumerate(self.bufB):
+                d = abs(tb - ta)
+                if d < dt: i, fb, dt = j, gb, d
+            if dt <= self.tol:
+                self.bufA.popleft()
+                del self.bufB[i]
                 return PairedBundle(
-                    A=CamBundle(0, fA, self.A.intr),
-                    B=CamBundle(1, fB, self.B.intr),
+                    A=CamBundle(0, fa, self.intrA),
+                    B=CamBundle(1, fb, self.intrB),
                     dt_ms=dt*1000.0
                 )
-            self.bufB.append((fB.ts_host_s, fB))
         return None
 
-    def close(self):
-        self.A.close(); self.B.close()
+    def close(self): pass
