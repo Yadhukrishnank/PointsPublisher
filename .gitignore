@@ -4,6 +4,7 @@ __pycache__/
 
 # Ignore virtual environments
 .venv311/
+.venv/
 
 # Ignore log files
 *.log

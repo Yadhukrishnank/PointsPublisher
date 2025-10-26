@@ -1,174 +1,594 @@
+# Streamer.py — unified N-camera entrypoint (PointsPublisher-main)
+# - Reuses your repo's CameraContext + AzureKinectCameraStrategy
+# - Optional OpenCV preview windows (global.preview / global.preview_depth or CLI flags)
+# - Sends v2 packets: header + optional intrinsics + optional pose
+# - Works with your (rgb, depth, config) frame format and ProcessingStep.process(rgb, depth)
+
+import sys, time, threading, yaml, inspect, argparse
+from pathlib import Path
 import numpy as np
-import streamer.Source as s
-import streamer.ProcessingStep as p
-import streamer.Actions as a
-import streamer.Datasources as ds
 import cv2
-import time
-import logging
+import zmq
 
-"""
-Streams Azure Kinect color-aligned depth to Meta Quest:
-Clamp → Median → ROI crop → Downsample → JPEG → Show + ZMQ publish
-"""
+# import your step builder + aliases
+from streamer.ProcessingStep import build_default_steps, Clamp, Median, ROICrop, Downsample
 
-# ---------- logging helpers ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 
-def human_bytes(n: int) -> str:
-    if n < 1024:
-        return f"{n} B"
-    for unit in ["KB", "MB", "GB", "TB"]:
-        n /= 1024.0
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-    return f"{n:.1f} PB"
+# ========================= Packet v2 =========================
 
-# ---------- camera setup ----------
-strategy = s.AzureKinectCameraStrategy(1280, 720)
-camera = s.CameraContext(strategy)
-camera.init()
-intrinsics = camera.get_intrinsics()
-config = ds.CameraConfig(
-    fx=intrinsics["fx"],
-    fy=intrinsics["fy"],
-    cx=intrinsics["ppx"],
-    cy=intrinsics["ppy"],
-)
-orig_w, orig_h = 1280, 720  # Azure color / transformed_depth
+MAGIC = 0xABCD1234
+VERSION = 2
+FLAG_POSE = 1   # bit0
+FLAG_INTR = 2   # bit1
 
-# ---------- processing chain ----------
-# ROI in *full-res* pixel coords (before downsample)
-roi_x0, roi_y0 = 160, 90
-roi_w, roi_h = 640, 360
+class PacketV2Writer:
+    """
+    Layout (little-endian):
+    [Header 36B]: u32 MAGIC, u16 VERSION, u16 flags, u32 camera_id, u64 ts_us, u32 w, u32 h, u32 rgb_len, u32 depth_len
+    [Intrinsics 16B] if flags&FLAG_INTR: float32[4] = fx,fy,cx,cy
+    [RGB JPEG rgb_len B]
+    [Depth U16 depth_len B] (aligned to color, mm)
+    [Pose 4x4 64B] if flags&FLAG_POSE: float32[16] row-major world<-camera (T_wc)
+    """
+    def __init__(self, send_intrinsics: bool = True):
+        self.send_intrinsics = send_intrinsics
 
-blocksize = 2
+    def pack(self, camera_id: int, timestamp_us: int, width: int, height: int,
+             rgb_jpeg_bytes: bytes, depth_u16: np.ndarray,
+             intrinsics: np.ndarray | None, pose_Twc: np.ndarray | None) -> bytes:
+        import struct
+        flags = 0
+        if pose_Twc is not None:
+            flags |= FLAG_POSE
+        if self.send_intrinsics and intrinsics is not None:
+            flags |= FLAG_INTR
 
-processing = p.DepthClampAndMask(z_min_m=0.25, z_max_m=5.0)
-processing.set_next(p.LocalMedianReject(win=3, thr_mm=120)) \
-            .set_next(p.DownSampling(blocksize=blocksize)) \
-            .set_next(p.EncodeRGBAsJPEG())
-# set_next(p.LocalMedianReject(win=3, thr_mm=120)) \
-        #   .set_next(p.CropROI(roi_x0, roi_y0, roi_w, roi_h)) \
-# ---------- actions / publisher ----------
-culling = ds.Culling(
-    zcullmin=0.05,
-    zcullmax=4.0,
-    x_cull=1.0,
-    y_cull=1.0,
-)
+        depth_u16 = np.asarray(depth_u16, dtype=np.uint16)
+        depth_bytes = depth_u16.tobytes(order="C")
 
-actions = a.ActionPipeline()
-actions.add_action(a.ShowImageAction())
+        header = struct.pack("<IHHI Q I I I I",
+                             MAGIC, VERSION, flags, int(camera_id),
+                             int(timestamp_us), int(width), int(height),
+                             len(rgb_jpeg_bytes), len(depth_bytes))
+        parts = [header]
+        if flags & FLAG_INTR:
+            intr = np.asarray(intrinsics, dtype=np.float32).reshape(4)
+            parts.append(struct.pack("<4f", *intr))
+        parts.append(rgb_jpeg_bytes)
+        parts.append(depth_bytes)
+        if flags & FLAG_POSE:
+            T = np.asarray(pose_Twc, dtype=np.float32).reshape(16)
+            parts.append(struct.pack("<16f", *T))
+        return b"".join(parts)
 
-zmq_pub = a.ZMQPublishAction(culling, config_scaling=1.0)
-actions.add_action(zmq_pub)
+# ====================== Pose loader (optional) ======================
 
-last_log = time.time()
-frames_sec = 0
-valid_sec = 0
-after_cull_sec = 0
+def load_pose_4x4(path: str | None) -> np.ndarray | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        print(f"[Pose] Not found: {p}")
+        return None
+    try:
+        if p.suffix.lower() == ".npz":
+            data = np.load(p)
+            for key in ("T_wc", "pose", "T", "matrix", "M"):
+                if key in data and data[key].shape == (4, 4):
+                    return data[key].astype(np.float32)
+            if "R" in data and "t" in data:
+                T = np.eye(4, dtype=np.float32)
+                T[:3,:3] = data["R"].reshape(3,3)
+                T[:3,  3] = data["t"].reshape(3)
+                return T
+            print(f"[Pose] {p.name}: no 4x4 key (expected T_wc/pose/T/matrix/M)")
+            return None
+        try:
+            T = np.loadtxt(p, dtype=np.float32).reshape(4,4)
+            return T
+        except Exception:
+            T = np.load(p).astype(np.float32).reshape(4,4)
+            return T
+    except Exception as e:
+        print(f"[Pose] Failed to load {p}: {e}")
+        return None
 
-# cache for telemetry meshgrid to avoid per-frame realloc
-_cached_shape = None
-_cached_uu = None
-_cached_vv = None
+# =================== Reuse your repo modules ===================
+
+USE_EXISTING = True
+CameraContext = None
+AzureKinectStrategy = None
+# (Clamp/Median/ROICrop/Downsample already imported above)
 
 try:
-    while True:
-        # 1) Grab a frame
-        rgb, depth, cam_cfg = camera.get_frame()
+    from streamer.Source import CameraContext as _CC
+    CameraContext = _CC
+except Exception as e:
+    print(f"[Import] streamer.Source.CameraContext not available: {e}")
+    USE_EXISTING = False
 
-        # 2) Azure color can be BGRA; convert to BGR for JPEG safety
-        if rgb.ndim == 3 and rgb.shape[2] == 4:
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGRA2BGR)
+if USE_EXISTING:
+    try:
+        from streamer.Source import AzureKinectCameraStrategy as _AKS
+        AzureKinectStrategy = _AKS
+        print("[Import] Using repo strategy class: AzureKinectCameraStrategy")
+    except Exception as e:
+        print(f"[Import] Could not import AzureKinectCameraStrategy from streamer.Source: {e}")
+        USE_EXISTING = False
 
-        # 3) Process: Clamp → Median → ROI → Downsample → JPEG
-        rgb_proc, depth_proc = processing.process(rgb, depth)
+# ========== Minimal Azure fallback (only if your strategy import fails) ==========
 
-        # 4) Packet header: processed size (W,H after ROI+DS)
-        h_proc, w_proc = depth_proc.shape[:2]
-        zmq_pub.set_width_height(w_proc, h_proc)
+class _FallbackAzureK4A:
+    def __init__(self, device_index=0, color_res=(1280,720), align_to_color=True):
+        try:
+            from pyk4a import PyK4A, Config, ColorResolution, DepthMode, ImageFormat, CalibrationType
+        except Exception as e:
+            raise RuntimeError("pyk4a not installed and no existing AzureKinectStrategy found.") from e
+        self.PyK4A = PyK4A
+        self.Config = Config
+        self.ColorResolution = ColorResolution
+        self.DepthMode = DepthMode
+        self.ImageFormat = ImageFormat
+        self.CalibrationType = CalibrationType
+        self.device_index = device_index
+        self.color_res = color_res
+        self.align = align_to_color
+        self.k4a = None
+        self._intr = None
+        self._trans = None
 
-        # 5) Intrinsics: shift principal point by crop; scale by DS in publisher
-        cam_cfg_cropped = ds.CameraConfig(
-            fx=cam_cfg.fx,
-            fy=cam_cfg.fy,
-            cx=cam_cfg.cx - roi_x0,
-            cy=cam_cfg.cy - roi_y0,
+    def open(self):
+        res_map = {
+            (1280,720): self.ColorResolution.RES_720P,
+            (1920,1080): self.ColorResolution.RES_1080P,
+            (2560,1440): self.ColorResolution.RES_1440P,
+            (3840,2160): self.ColorResolution.RES_2160P,
+        }
+        cfg = self.Config(
+            color_resolution=res_map.get(tuple(self.color_res), self.ColorResolution.RES_720P),
+            depth_mode=self.DepthMode.NFOV_UNBINNED,
+            color_format=self.ImageFormat.COLOR_BGRA32,
+            synchronized_images_only=True
         )
-        zmq_pub.config_scaling = (1.0 / float(blocksize)) if blocksize > 1 else 1.0
-        zmq_pub.set_config(cam_cfg_cropped)
+        self.k4a = self.PyK4A(cfg, device_id=self.device_index)
+        self.k4a.start()
+        K = self.k4a.calibration.get_camera_matrix(self.CalibrationType.COLOR)
+        fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
+        self._intr = np.array([fx, fy, cx, cy], dtype=np.float32)
+        self._trans = getattr(self.k4a, "transformation", None)
+        if self._trans is None and self.align:
+            print("[Azure] WARNING: PyK4A 'transformation' not available; sending UNALIGNED depth.")
+            self.align = False
 
-        # 6) Send to actions (local preview + ZMQ)
-        actions.execute_all(rgb_proc, depth_proc)
+    def close(self):
+        if self.k4a:
+            self.k4a.stop()
+            self.k4a = None
 
-        # ---------- diagnostics: processing + estimated wire sizes ----------
-        # rgb_proc is a JPEG byte buffer (np.ndarray), depth_proc is uint16 image
-        rgb_len = int(rgb_proc.nbytes) if hasattr(rgb_proc, "nbytes") else len(bytes(rgb_proc))
-        depth_len = int(depth_proc.size * depth_proc.dtype.itemsize)  # W*H*2
+    def get_frame(self):
+        cap = self.k4a.get_capture()
+        if cap is None or cap.color is None or cap.depth is None:
+            return None
+        depth = cap.depth
+        if self.align and self._trans is not None:
+            depth = self._trans.depth_image_to_color_camera(depth)
+        bgr = cv2.cvtColor(cap.color, cv2.COLOR_BGRA2BGR)
+        h, w = bgr.shape[:2]
+        if depth.shape != (h, w):
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        class _Cfg: pass
+        cfg = _Cfg(); cfg.fx, cfg.fy, cfg.cx, cfg.cy = self._intr
+        return bgr, depth.astype(np.uint16), cfg
 
+# ====================== Simple Preview Hub (RGB + Depth) ======================
 
-        # 7) Telemetry (mirrors GPU math) — uses CROPPED+SCALED intrinsics
-        z = depth_proc.astype(np.float32) * 0.001  # meters
-        valid_mask = z > 0.0
+def _resolve_colormap_code(name_or_code):
+    # Accept int code or string name; fallback to JET
+    if isinstance(name_or_code, int):
+        return int(name_or_code)
+    name = str(name_or_code).strip().upper()
+    return getattr(cv2, f"COLORMAP_{name}", cv2.COLORMAP_JET)
 
-        fx_s = cam_cfg_cropped.fx * zmq_pub.config_scaling
-        fy_s = cam_cfg_cropped.fy * zmq_pub.config_scaling
-        cx_s = cam_cfg_cropped.cx * zmq_pub.config_scaling
-        cy_s = cam_cfg_cropped.cy * zmq_pub.config_scaling
+def _colorize_depth_mm(depth_u16: np.ndarray, dmin: int, dmax: int, cmap_code: int) -> np.ndarray:
+    """
+    depth_u16: uint16 in millimetres, HxW
+    returns: BGR uint8 HxWx3 colorized image
+    """
+    d = np.asarray(depth_u16, dtype=np.float32)
+    valid = d > 0
+    lo, hi = float(dmin), float(max(dmax, dmin + 1))
+    d = np.clip(d, lo, hi)
+    norm = (d - lo) * (255.0 / (hi - lo))
+    norm[~valid] = 0.0
+    img8 = norm.astype(np.uint8)
+    cm = cv2.applyColorMap(img8, cmap_code)
+    cm[~valid] = (0, 0, 0)
+    return cm
 
-        if _cached_shape != (h_proc, w_proc):
-            _cached_shape = (h_proc, w_proc)
-            _cached_uu, _cached_vv = np.meshgrid(
-                np.arange(w_proc, dtype=np.float32),
-                np.arange(h_proc, dtype=np.float32),
-            )
-        uu, vv = _cached_uu, _cached_vv
+class PreviewHub(threading.Thread):
+    """Single UI thread showing latest RGB and Depth per camera. ESC closes windows."""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.enabled_rgb = False
+        self.enabled_depth = False
+        self._run = False
+        self._lock = threading.Lock()
+        self._rgb = {}    # cam_id -> BGR
+        self._depth = {}  # cam_id -> BGR depth colorized
 
-        X = (uu - cx_s) * z / fx_s
-        Y = (vv - cy_s) * z / fy_s
+    def enable(self, rgb: bool, depth: bool):
+        self.enabled_rgb = bool(rgb)
+        self.enabled_depth = bool(depth)
+        if (self.enabled_rgb or self.enabled_depth) and not self._run:
+            self._run = True
+            self.start()
 
-        c = culling
-        cull_mask = (
-            valid_mask
-            & (z >= c.zcullmin)
-            & (z <= c.zcullmax)
-            & (np.abs(X) <= c.x_cull)
-            & (np.abs(Y) <= c.y_cull)
+    def update(self, cam_id: int, bgr: np.ndarray | None, depth_bgr: np.ndarray | None):
+        if not self._run:
+            return
+        with self._lock:
+            if self.enabled_rgb and bgr is not None:
+                self._rgb[cam_id] = bgr
+            if self.enabled_depth and depth_bgr is not None:
+                self._depth[cam_id] = depth_bgr
+
+    def run(self):
+        while self._run:
+            imgs = []
+            with self._lock:
+                if self.enabled_rgb:
+                    imgs.extend(("RGB", cid, img) for cid, img in self._rgb.items())
+                if self.enabled_depth:
+                    imgs.extend(("Depth", cid, img) for cid, img in self._depth.items())
+            for kind, cid, img in imgs:
+                cv2.imshow(f"{kind} - Cam {cid}", img)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC
+                self._run = False
+                break
+        cv2.destroyAllWindows()
+
+PREVIEW = PreviewHub()
+
+# =================== ZMQ publisher (v2) ===================
+
+class ZmqPublisherV2:
+    def __init__(self, port: int, camera_id: int, pose_4x4: np.ndarray | None,
+                 jpeg_quality: int = 80, send_intrinsics: bool = True,
+                 bind_host: str = "0.0.0.0"):
+        self.camera_id = int(camera_id)
+        self.pose_4x4 = pose_4x4
+        self.jpeg_quality = int(jpeg_quality)
+        self.packet = PacketV2Writer(send_intrinsics=send_intrinsics)
+        ctx = zmq.Context.instance()
+        self.sock = ctx.socket(zmq.PUSH)
+        self.sock.setsockopt(zmq.SNDHWM, 2)
+        self.sock.setsockopt(zmq.LINGER, 0)
+        self.addr = f"tcp://{bind_host}:{int(port)}"
+        self.sock.bind(self.addr)
+        print(f"[ZmqPublisherV2] Cam{self.camera_id} PUSH {self.addr} pose={'yes' if pose_4x4 is not None else 'no'}")
+        if self.pose_4x4 is not None:
+            T = np.asarray(self.pose_4x4, dtype=np.float32).reshape(4,4)
+            pretty = "\n".join("   " + " ".join(f"{v: .6f}" for v in row) for row in T)
+            print(f"[Cam{self.camera_id}] T_wc (row-major, meters):\n{pretty}")
+
+    def _extract(self, frame):
+        """Return (bgr, rgb_jpeg_or_None, depth_u16, (w,h), intr[4] or None, ts_us)."""
+        bgr = None; jpg = None; depth = None; size = None; intr = None; ts = None
+
+        # Your repo: (rgb, depth, config)
+        if isinstance(frame, tuple) and len(frame) == 3:
+            bgr, depth, cfg = frame
+            if bgr is not None:
+                h, w = bgr.shape[:2]; size = (w, h)
+            elif depth is not None and hasattr(depth, "shape"):
+                h, w = depth.shape[:2]; size = (w, h)
+            if hasattr(cfg, "fx"):
+                intr = np.array([cfg.fx, cfg.fy, cfg.cx, cfg.cy], dtype=np.float32)
+            if hasattr(cfg, "timestamp_us"):
+                ts = int(cfg.timestamp_us)
+
+        # Fallbacks (dict-like / attribute-like)
+        if isinstance(frame, dict):
+            bgr   = frame.get("bgr") or frame.get("rgb") or frame.get("color") or bgr
+            jpg   = frame.get("rgb_jpeg") or frame.get("jpeg") or jpg
+            depth = frame.get("depth_u16") or frame.get("depth") or depth
+            wh    = frame.get("size")
+            size  = size or (wh if wh is not None else (frame.get("width"), frame.get("height")))
+            intr  = frame.get("intrinsics") or frame.get("intr") or intr
+            ts    = frame.get("timestamp_us") or frame.get("ts_us") or ts
+
+        for name in ("bgr","rgb","color"):
+            if bgr is None and hasattr(frame, name): bgr = getattr(frame, name)
+        for name in ("rgb_jpeg","jpeg"):
+            if jpg is None and hasattr(frame, name): jpg = getattr(frame, name)
+        for name in ("depth_u16","depth"):
+            if depth is None and hasattr(frame, name): depth = getattr(frame, name)
+        if size is None:
+            if hasattr(frame, "size"): size = getattr(frame, "size")
+            elif hasattr(frame, "width") and hasattr(frame, "height"):
+                size = (getattr(frame, "width"), getattr(frame, "height"))
+        for name in ("intrinsics","intr"):
+            if intr is None and hasattr(frame, name): intr = getattr(frame, name)
+        for name in ("timestamp_us","ts_us"):
+            if ts is None and hasattr(frame, name): ts = getattr(frame, name)
+
+        if size is None:
+            if bgr is not None: h, w = bgr.shape[:2]; size = (w, h)
+            elif depth is not None and hasattr(depth, "shape"): h, w = depth.shape[:2]; size = (w, h)
+            else: raise ValueError("No size could be inferred from frame.")
+        w, h = int(size[0]), int(size[1])
+
+        if depth is None:
+            return None, None, None, (w, h), intr, int(ts if ts is not None else time.time()*1e6)
+
+        depth = np.asarray(depth, dtype=np.uint16).reshape(h, w)
+        intr  = None if intr is None else np.asarray(intr, dtype=np.float32).reshape(4)
+        ts    = int(ts if ts is not None else time.time() * 1e6)
+        return bgr, jpg, depth, (w, h), intr, ts
+
+    def push(self, frame):
+        bgr, jpg, depth, (w, h), intr, ts = self._extract(frame)
+        if depth is None:
+            return
+        if jpg is None:
+            if bgr is None:
+                return
+            ok, enc = cv2.imencode(".jpg", np.asarray(bgr), [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            if not ok:
+                return
+            jpg = enc.tobytes()
+        payload = self.packet.pack(
+            camera_id=self.camera_id, timestamp_us=ts,
+            width=w, height=h, rgb_jpeg_bytes=jpg, depth_u16=depth,
+            intrinsics=intr, pose_Twc=self.pose_4x4
         )
+        try:
+            self.sock.send(payload, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            pass
 
-        frames_sec += 1
-        valid_sec += int(valid_mask.sum())
-        after_cull_sec += int(cull_mask.sum())
+# ================= Strategy factory & helpers =================
 
-        now = time.time()
-        if now - last_log >= 1.0:
-            total_pts = w_proc * h_proc
-            fps_send = frames_sec / (now - last_log)
-            logging.info(
-                f"[SENDER] fps={fps_send:.1f}  frame={w_proc}x{h_proc} ({total_pts})  "
-                f"valid/s={valid_sec}  est_after_cull/s={after_cull_sec}  "
-                f"JPEG={human_bytes(rgb_len)}  DEPTH={human_bytes(depth_len)}"
-                f"est_size/frame≈{human_bytes(rgb_len + depth_len)}"
+def _safe_construct(cls, **kwargs):
+    sig = inspect.signature(cls.__init__)
+    allowed = {k:v for k,v in kwargs.items() if k in sig.parameters}
+    try:
+        return cls(**allowed) if allowed else cls()
+    except Exception:
+        return cls()
+
+def make_strategy(cam_cfg: dict, global_cfg: dict):
+    cam_type = str(cam_cfg.get("type", "azure")).lower()
+    color_res = tuple(cam_cfg.get("color_res", [1280, 720]))
+    align_to_color = bool(global_cfg.get("align_to_color", True))
+
+    if cam_type == "azure":
+        if USE_EXISTING and CameraContext and AzureKinectStrategy:
+            w, h = color_res
+            return _safe_construct(
+                AzureKinectStrategy,
+                width=w, height=h,
+                color_res=color_res,
+                device_index=cam_cfg.get("device", 0),
+                device=cam_cfg.get("device", 0),
+                align_to_color=align_to_color,
+                align=align_to_color
             )
-            last_log = now
-            frames_sec = valid_sec = after_cull_sec = 0
+        return _FallbackAzureK4A(device_index=cam_cfg.get("device", 0),
+                                 color_res=color_res, align_to_color=align_to_color)
 
-except KeyboardInterrupt:
-    pass
-finally:
-    camera.close()
-    cv2.destroyAllWindows()
+    raise ValueError(f"Unknown camera type: {cam_type}")
 
-logging.info(
-    f"[SENDER] fps={fps_send:.1f}  frame={w_proc}x{h_proc} ({total_pts})  "
-    f"valid/s={valid_sec}  est_after_cull/s={after_cull_sec}  "
-    f"est_size/frame≈{human_bytes(rgb_len + depth_len)}  "
-    f"Cx={float(cx_s)}"
+def resolve_port(cam_cfg: dict, base_port: int) -> int:
+    p = cam_cfg.get("port")
+    return int(p) if p is not None else int(base_port) + (int(cam_cfg["id"]) - 1)
 
-)
+# ================= Intrinsics helpers (ROI / stride adjustment) =================
+
+def _intr_get(i):
+    if i is None: return None
+    try:
+        return float(i.fx), float(i.fy), float(i.cx), float(i.cy), "obj"
+    except AttributeError:
+        return float(i["fx"]), float(i["fy"]), float(i["cx"]), float(i["cy"]), "dict"
+
+def _intr_set(i, fx, fy, cx, cy, kind):
+    if i is None: return None
+    if kind == "obj":
+        i.fx, i.fy, i.cx, i.cy = fx, fy, cx, cy
+    else:
+        i["fx"], i["fy"], i["cx"], i["cy"] = fx, fy, cx, cy
+    return i
+
+def _adjust_intrinsics_for_roi_stride(intr, global_cfg):
+    """Apply ROI shift and downsample scaling to intrinsics in-place."""
+    tup = _intr_get(intr)
+    if tup is None:
+        return intr
+    fx, fy, cx, cy, kind = tup
+    roi = global_cfg.get("roi_xywh")
+    s   = int(global_cfg.get("downsample_stride", 1) or 1)
+    if roi:
+        x0, y0 = int(roi[0]), int(roi[1])
+        cx -= x0
+        cy -= y0
+    if s > 1:
+        fx /= s; fy /= s; cx /= s; cy /= s
+    return _intr_set(intr, fx, fy, cx, cy, kind)
+
+# ======================== Pipeline worker ========================
+
+class CameraPipeline(threading.Thread):
+    def __init__(self, cam_cfg: dict, global_cfg: dict,
+                 preview_rgb: bool, preview_depth: bool,
+                 depth_min_mm: int, depth_max_mm: int, depth_cmap_code: int):
+        super().__init__(daemon=True)
+        self.cam_id = int(cam_cfg["id"])
+        self.port = resolve_port(cam_cfg, int(global_cfg.get("base_port", 5555)))
+        self.fps_max = int(global_cfg.get("fps_max", 30))
+        self.frame_period = 1.0 / self.fps_max if self.fps_max > 0 else 0.0
+
+        self.preview_rgb = bool(preview_rgb)
+        self.preview_depth = bool(preview_depth)
+        self.depth_min_mm = int(depth_min_mm)
+        self.depth_max_mm = int(depth_max_mm)
+        self.depth_cmap_code = int(depth_cmap_code)
+
+        pose = None
+        if cam_cfg.get("pose_file"):
+            pose_dir = Path(global_cfg.get("pose_dir", "."))
+            p = Path(cam_cfg["pose_file"])
+            if not p.is_absolute():
+                p = pose_dir / p
+            pose = load_pose_4x4(str(p))
+        self.pose = pose
+
+        self.global_cfg = global_cfg
+        self.strategy = make_strategy(cam_cfg, global_cfg)
+
+        if CameraContext and hasattr(CameraContext, "__call__"):
+            self.ctx = CameraContext(self.strategy)
+            self._grab  = self.ctx.get_frame
+            self._open  = getattr(self.ctx, "init", getattr(self.ctx, "open", getattr(self.ctx, "connect", None)))
+            self._close = getattr(self.ctx, "close", lambda: None)
+        else:
+            self.ctx = self.strategy
+            self._grab  = getattr(self.ctx, "get_frame", None)
+            self._open  = getattr(self.ctx, "open", None)
+            self._close = getattr(self.ctx, "close", lambda: None)
+
+        self.steps = build_default_steps(global_cfg)
+        self.pub = ZmqPublisherV2(
+            port=self.port, camera_id=self.cam_id, pose_4x4=self.pose,
+            jpeg_quality=int(global_cfg.get("jpeg_quality", 80)),
+            send_intrinsics=bool(global_cfg.get("send_intrinsics", True)),
+        )
+        self._fps_t0 = time.time()
+        self._fps_n = 0
+        self._next_deadline = time.time()
+
+    def run(self):
+        try:
+            if self._open: self._open()
+        except Exception as e:
+            print(f"[Cam{self.cam_id}] FAILED to open device on port {self.port}: {e}")
+            return
+
+        try:
+            while True:
+                tup = self._grab()
+                if tup is None:
+                    continue
+
+                # (rgb, depth, config)
+                if isinstance(tup, tuple) and len(tup) == 3:
+                    rgb, depth, cfg = tup
+
+                    # Steps (Clamp → Median → ROI → Downsample)
+                    for s in self.steps:
+                        try:
+                            rgb, depth = s.process(rgb, depth)
+                        except Exception:
+                            pass
+
+                    # Adjust intrinsics for ROI/stride (must match what the steps did)
+                    try:
+                        cfg = _adjust_intrinsics_for_roi_stride(cfg, self.global_cfg)
+                    except Exception:
+                        pass
+
+                    # Depth preview (colorized)
+                    depth_bgr = None
+                    if self.preview_depth and depth is not None:
+                        depth_bgr = _colorize_depth_mm(depth, self.depth_min_mm, self.depth_max_mm, self.depth_cmap_code)
+
+                    # RGB preview
+                    if self.preview_rgb:
+                        PREVIEW.update(self.cam_id, rgb, depth_bgr)
+
+                    # Send
+                    self.pub.push((rgb, depth, cfg))
+                else:
+                    # Unknown layout; still attempt to push
+                    self.pub.push(tup)
+
+                self._fps_n += 1
+
+                # Optional FPS throttle
+                if self.frame_period > 0:
+                    self._next_deadline += self.frame_period
+                    now = time.time()
+                    if self._next_deadline > now:
+                        time.sleep(self._next_deadline - now)
+                    else:
+                        self._next_deadline = now
+
+                # Periodic FPS log
+                now = time.time()
+                if now - self._fps_t0 >= 2.0:
+                    fps = self._fps_n / (now - self._fps_t0)
+                    print(f"[Cam{self.cam_id}] port={self.port} ~{fps:.1f} fps")
+                    self._fps_t0 = now
+                    self._fps_n = 0
+
+        finally:
+            try: self._close()
+            except: pass
+
+# ============================= Main =============================
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--preview", action="store_true", help="Show OpenCV RGB preview")
+    ap.add_argument("--preview-depth", action="store_true", help="Show colorized depth preview")
+    ap.add_argument("--depth-min", type=int, default=None, help="Depth min (mm) for preview normalization")
+    ap.add_argument("--depth-max", type=int, default=None, help="Depth max (mm) for preview normalization")
+    ap.add_argument("--depth-cmap", type=str, default=None, help="OpenCV colormap name (e.g., JET, TURBO, INFERNO, VIRIDIS, MAGMA)")
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+    cfg_path = Path("config/multicam.yaml")
+    if not cfg_path.exists():
+        print(f"Config not found: {cfg_path}")
+        print("Example:\n"
+              "global:\n"
+              "  base_port: 5555\n  jpeg_quality: 80\n  fps_max: 30\n  send_intrinsics: true\n  align_to_color: true\n"
+              "  pose_dir: ./poses\n  preview: false\n  preview_depth: false\n  depth_min_mm: 400\n  depth_max_mm: 6000\n  depth_colormap: JET\n"
+              "cameras:\n"
+              "  - id: 1\n    type: azure\n    device: 0\n    port: 5555\n    color_res: [1280, 720]\n")
+        sys.exit(1)
+
+    cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
+    global_cfg = cfg.get("global", {})
+    cameras = cfg.get("cameras", [])
+    if not cameras:
+        print("No cameras in config."); sys.exit(1)
+
+    # Preview options (YAML or CLI)
+    preview_rgb = bool(global_cfg.get("preview", False) or args.preview)
+    preview_depth = bool(global_cfg.get("preview_depth", False) or args.preview_depth)
+    dmin = int(args.depth_min if args.depth_min is not None else global_cfg.get("depth_min_mm", 400))
+    dmax = int(args.depth_max if args.depth_max is not None else global_cfg.get("depth_max_mm", 6000))
+    cmap_name_or_code = args.depth_cmap if args.depth_cmap is not None else global_cfg.get("depth_colormap", "JET")
+    depth_cmap_code = _resolve_colormap_code(cmap_name_or_code)
+
+    if preview_rgb or preview_depth:
+        PREVIEW.enable(preview_rgb, preview_depth)
+
+    print("=== Streamer (N-cam unified) ===")
+    for c in cameras:
+        port = resolve_port(c, int(global_cfg.get("base_port", 5555)))
+        print(f"  - Cam{c['id']}: type={c.get('type','azure')} port={port} pose={'yes' if c.get('pose_file') else 'no'}")
+
+    workers = [CameraPipeline(c, global_cfg, preview_rgb, preview_depth, dmin, dmax, depth_cmap_code) for c in cameras]
+    for w in workers: w.start()
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+
+if __name__ == "__main__":
+    main()

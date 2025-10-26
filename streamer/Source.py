@@ -1,269 +1,356 @@
-# Source.py  (DepthAI v2, two OAKs, plus two-camera dummy)
-from dataclasses import dataclass
-from collections import deque
-import time
-import numpy as np
+from abc import ABC, abstractmethod
 import cv2
+import zmq
+import struct
+import socket
+import numpy as np
+import streamer.Datasources as ds
+
+from pyk4a import PyK4A, Config, CalibrationType, ColorResolution, DepthMode
+from pyk4a.calibration import Calibration
+
+class Source(ABC):
+    @abstractmethod
+    def connect(self):
+        pass
+
+    @abstractmethod
+    def get_frame(self):
+        pass
+
+    @abstractmethod
+    def close(self):
+        pass
+
+
+
+class CameraStrategy(Source):
+    @abstractmethod
+    def apply_filters(self, depth_frame):
+        pass
+
+    @abstractmethod
+    def get_intrinsics(self):
+        pass
+
+
 
 try:
-    import depthai as dai  # DepthAI v2
-except Exception:
+    import depthai as dai
+except ImportError:
     dai = None
 
-from Datasources import CameraConfig
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
 
-# -------------------- Data containers --------------------
+class RealSenseCameraStrategy(CameraStrategy):
+    def __init__(self, width=640, height=480):
+        if rs is None:
+            raise RuntimeError("RealSense SDK is not installed.")
+        self.width = width
+        self.height = height
+        self.pipeline = None
+        self.profile = None
 
-@dataclass
-class Frame:
-    rgb: np.ndarray          # HxWx3 (BGR)
-    depth: np.ndarray        # HxW   (uint16 mm)
-    ts_host_s: float         # host timestamp (for cross-device pairing)
-    w: int
-    h: int
+    def connect(self):
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, 30)
+        config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, 30)
+        self.profile = self.pipeline.start(config)
+        self.align = rs.align(rs.stream.color)
 
-@dataclass
-class CamBundle:
-    cam_id: int
-    frame: Frame
-    intr: CameraConfig
+    def get_frame(self):
+        frames = self.pipeline.wait_for_frames()
+        aligned = self.align.process(frames)
+        depth_frame = aligned.get_depth_frame()
+        color_frame = aligned.get_color_frame()
+        if not depth_frame or not color_frame:
+            return None, None
+        #depth_frame = self.apply_filters(depth_frame)
 
-@dataclass
-class PairedBundle:
-    A: CamBundle
-    B: CamBundle
-    dt_ms: float
+        o = self.get_intrinsics()
+        return np.asanyarray(color_frame.get_data()), np.asanyarray(depth_frame.get_data()), ds.CameraConfig(o["fx"], o["fy"], o["ppx"], o["ppy"])
 
-# -------------------- Single OAK (DepthAI v2) --------------------
+    def apply_filters(self, depth_frame):
+        #filtered = self.spatial.process(depth_frame)
+        #filtered = self.temporal.process(filtered)
+        #filtered = self.hole_filling.process(filtered)
+        pass
 
-class OAKSingleDevice:
-    """
-    One device: ColorCamera + Mono L/R + StereoDepth aligned to CAM_A (color).
-    Exposes color intrinsics at (rgb_w, rgb_h).
-    """
-    def __init__(self, mx_id: str, rgb_w=1280, rgb_h=720, fps=30):
+    def get_intrinsics(self):
+        if self.profile is None:
+            raise RuntimeError("Camera not connected.")
+
+        depth_stream = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        intr = depth_stream.get_intrinsics()
+        return {
+            "width": intr.width,
+            "height": intr.height,
+            "fx": intr.fx,
+            "fy": intr.fy,
+            "ppx": intr.ppx,
+            "ppy": intr.ppy,
+            "model": str(intr.model),
+            "distortion_coeffs": list(intr.coeffs)
+        }
+
+    def close(self):
+        self.pipeline.stop()
+
+
+
+class LuxonisCameraStrategy(CameraStrategy):
+    def __init__(self, width=640, height=480):
         if dai is None:
-            raise RuntimeError("depthai not installed. Please install DepthAI v2.")
-        self.mx = mx_id
-        self.rgb_w = int(rgb_w)
-        self.rgb_h = int(rgb_h)
-        self.fps   = int(fps)
+            raise RuntimeError("DepthAI SDK not installed..")
+        self.width = width
+        self.height = height
+        self.device = None
 
-        self.dev = dai.Device(dai.DeviceInfo(mx_id))
-        self.pipeline = self._build_pipeline()
-        self.dev.startPipeline(self.pipeline)
+    def connect(self):
+        pipeline = dai.Pipeline()
 
-        self.qRgb = self.dev.getOutputQueue("rgb",   maxSize=4, blocking=False)
-        self.qDep = self.dev.getOutputQueue("depth", maxSize=4, blocking=False)
+        # Mono-Kameras für Stereo
+        monoLeft = pipeline.createMonoCamera()
+        monoRight = pipeline.createMonoCamera()
+        monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        monoLeft.setBoardSocket(dai.CameraBoardSocket.CAM_B)
+        monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        monoRight.setBoardSocket(dai.CameraBoardSocket.CAM_C)
 
-        self._intr = self._get_color_intrinsics()
-
-    def _build_pipeline(self):
-        p = dai.Pipeline()
-
-        # Color
-        cam = p.create(dai.node.ColorCamera)
-        cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        cam.setFps(self.fps)
-        cam.setVideoSize(self.rgb_w, self.rgb_h)
-        cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-
-        # Mono + StereoDepth
-        monoL = p.create(dai.node.MonoCamera)
-        monoR = p.create(dai.node.MonoCamera)
-        monoL.setBoardSocket(dai.CameraBoardSocket.LEFT)
-        monoR.setBoardSocket(dai.CameraBoardSocket.RIGHT)
-        monoL.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-        monoR.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-        monoL.setFps(self.fps)
-        monoR.setFps(self.fps)
-
-        stereo = p.create(dai.node.StereoDepth)
-        stereo.setConfidenceThreshold(200)
+        stereo = pipeline.createStereoDepth()
+        stereo.initialConfig.setConfidenceThreshold(180)
+        stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_5x5)
         stereo.setLeftRightCheck(True)
+        stereo.setExtendedDisparity(True)
         stereo.setSubpixel(True)
-        stereo.setRectifyEdgeFillColor(0)
-        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)  # align to color
+        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+        stereo.setOutputSize(self.width, self.height)
 
-        monoL.out.link(stereo.left)
-        monoR.out.link(stereo.right)
+        monoLeft.out.link(stereo.left)
+        monoRight.out.link(stereo.right)
 
-        # Outputs
-        xout_rgb = p.create(dai.node.XLinkOut)
-        xout_rgb.setStreamName("rgb")
-        cam.video.link(xout_rgb.input)
+        camRgb = pipeline.createColorCamera()
+        camRgb.setPreviewSize(self.width, self.height)
+        camRgb.setInterleaved(False)
+        camRgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
 
-        xout_depth = p.create(dai.node.XLinkOut)
-        xout_depth.setStreamName("depth")
-        stereo.depth.link(xout_depth.input)
+        xoutRgb = pipeline.createXLinkOut()
+        xoutRgb.setStreamName("rgb")
+        camRgb.preview.link(xoutRgb.input)
 
-        return p
+        xoutDepth = pipeline.createXLinkOut()
+        xoutDepth.setStreamName("depth")
+        stereo.depth.link(xoutDepth.input)
 
-    def _get_color_intrinsics(self) -> CameraConfig:
-        calib = self.dev.readCalibration()
-        K = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, self.rgb_w, self.rgb_h)
-        fx = float(K[0][0]); fy = float(K[1][1]); cx = float(K[0][2]); cy = float(K[1][2])
-        return CameraConfig(fx=fx, fy=fy, cx=cx, cy=cy)
+        self.device = dai.Device(pipeline)
+        self.rgbQueue = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+        self.depthQueue = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
 
-    def try_get(self) -> Frame | None:
-        fRgb = self.qRgb.tryGet()
-        fDep = self.qDep.tryGet()
-        if fRgb is None or fDep is None:
-            return None
-        rgb = fRgb.getCvFrame()   # BGR
-        depth = fDep.getFrame()   # uint16 (mm), aligned to color
-        if rgb is None or depth is None:
-            return None
-        if depth.shape[:2] != rgb.shape[:2]:
-            depth = cv2.resize(depth, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
-        ts = time.time()  # host time for pairing across devices
-        return Frame(rgb=rgb, depth=depth, ts_host_s=ts, w=rgb.shape[1], h=rgb.shape[0])
+    def get_frame(self):
+        rgb = self.rgbQueue.get().getCvFrame()
+        depth = self.depthQueue.get().getFrame()
+        o = self.get_intrinsics()
+        return rgb, depth, ds.CameraConfig(o["fx"], o["fy"], o["ppx"], o["ppy"])
 
-    @property
-    def intr(self) -> CameraConfig:
-        return self._intr
+    def apply_filters(self, depth_frame):
+        return depth_frame
 
-    def close(self):
-        try:
-            self.qRgb.close(); self.qDep.close()
-        except: pass
-        try:
-            self.dev.close()
-        except: pass
+    def get_intrinsics(self):
+        if self.device is None:
+            raise RuntimeError("Camera not connected.")
 
-# -------------------- Two-device wrapper --------------------
+        calib = self.device.readCalibration()
+        depth_intrinsics = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_B, self.width, self.height)
+        fx, fy = depth_intrinsics[0][0], depth_intrinsics[1][1]
+        ppx, ppy = depth_intrinsics[0][2], depth_intrinsics[1][2]
 
-class MultiOAKSource:
-    def __init__(self, mx_id_A: str, mx_id_B: str, rgb_w=1280, rgb_h=720, fps=30, tol_ms=25.0):
-        self.A = OAKSingleDevice(mx_id_A, rgb_w, rgb_h, fps)
-        self.B = OAKSingleDevice(mx_id_B, rgb_w, rgb_h, fps)
-        self.tol = float(tol_ms) / 1000.0
-        self.bufA, self.bufB = deque(maxlen=120), deque(maxlen=120)
-
-    @staticmethod
-    def _best_match(ts, dq):
-        if not dq: return (None, None, 1e9)
-        best_i, best_dt = None, 1e9
-        for i, (t, fr) in enumerate(dq):
-            dt = abs(ts - t)
-            if dt < best_dt: best_dt, best_i = dt, i
-        return (best_i, dq[best_i][1], best_dt) if best_i is not None else (None, None, 1e9)
-
-    def try_get_pair(self) -> PairedBundle | None:
-        fA = self.A.try_get()
-        fB = self.B.try_get()
-
-        if fA is not None:
-            j, fb, dt = self._best_match(fA.ts_host_s, self.bufB)
-            if j is not None and dt <= self.tol:
-                _, fB2 = self.bufB[j]; del self.bufB[j]
-                return PairedBundle(
-                    A=CamBundle(0, fA, self.A.intr),
-                    B=CamBundle(1, fB2, self.B.intr),
-                    dt_ms=dt*1000.0
-                )
-            self.bufA.append((fA.ts_host_s, fA))
-
-        if fB is not None:
-            i, fa, dt = self._best_match(fB.ts_host_s, self.bufA)
-            if i is not None and dt <= self.tol:
-                _, fA2 = self.bufA[i]; del self.bufA[i]
-                return PairedBundle(
-                    A=CamBundle(0, fA2, self.A.intr),
-                    B=CamBundle(1, fB,  self.B.intr),
-                    dt_ms=dt*1000.0
-                )
-            self.bufB.append((fB.ts_host_s, fB))
-        return None
+        return {
+            "fx": fx,
+            "fy": fy,
+            "ppx": ppx,
+            "ppy": ppy,
+            "model": "perspective",
+            "distortion_coeffs": calib.getDistortionCoefficients(dai.CameraBoardSocket.CAM_A)
+        }
 
     def close(self):
-        self.A.close(); self.B.close()
-
-# -------------------- Two-camera dummy --------------------
-
-class MultiDummySource:
-    """
-    Two synthetic cameras that mimic real devices (for bandwidth / Unity testing).
-    """
-    def __init__(self, rgb_w=1280, rgb_h=720, fps=30, tol_ms=25.0):
-        self.w, self.h, self.fps = int(rgb_w), int(rgb_h), int(fps)
-        self.dt = 1.0 / max(1, self.fps)
-        now = time.time()
-        self.next_ts_A = now + 0.01
-        self.next_ts_B = now + 0.015
-        self.tol = float(tol_ms) / 1000.0
-        fx = fy = 900.0
-        cx, cy = self.w * 0.5, self.h * 0.5
-        self.intrA = CameraConfig(fx, fy, cx, cy)
-        self.intrB = CameraConfig(fx, fy, cx, cy)
-        self.bufA, self.bufB = deque(maxlen=60), deque(maxlen=60)
-        
-    def _gen_rgb(self, phase: float) -> np.ndarray:
-        """
-        Return HxWx3 BGR uint8 image with all channels having shape (h, w).
-        Previously we had (h,w), (h,1), (1,w) which breaks np.dstack.
-        """
-        h, w = self.h, self.w
-
-        # R channel: horizontal gradient (0..255 across width)
-        rx = np.linspace(0, 255, w, dtype=np.uint8)
-        r = np.tile(rx, (h, 1))  # (h, w)
-
-        # G channel: vertical gradient (0..255 across height)
-        gy = np.linspace(0, 255, h, dtype=np.uint8)
-        g = np.tile(gy.reshape(h, 1), (1, w))  # (h, w)
-
-        # B channel: time-varying solid
-        b_val = int((0.5 + 0.5 * np.sin(phase)) * 255) & 255
-        b = np.full((h, w), b_val, dtype=np.uint8)  # (h, w)
-
-        # BGR
-        img = np.dstack([b, g, r]).astype(np.uint8, copy=False)  # (h, w, 3)
-        return img
+        self.device.close()
 
 
-    def _gen_depth(self, z0_mm: int) -> np.ndarray:
-        xv = np.linspace(0, 1, self.w, dtype=np.float32)
-        yv = np.linspace(0, 1, self.h, dtype=np.float32)[:, None]
-        z = z0_mm + 800.0*xv + 400.0*yv
-        return z.astype(np.uint16)
 
-    def _emit_one(self, cam: int) -> Frame:
-        now = time.time()
-        if cam == 0:
-            self.next_ts_A = max(self.next_ts_A, now) + self.dt
-            ts = self.next_ts_A
-            rgb = self._gen_rgb(phase=ts*2.0)
-            depth = self._gen_depth(1200)
+class AzureKinectCameraStrategy(CameraStrategy):
+    def __init__(self, width=640, height=480, device_index=0):
+        self.width = width
+        self.height = height
+        self.device_index = int(device_index)   
+        self.device = None
+
+    def connect(self):
+        self.device = PyK4A(
+            Config(
+                color_resolution=self._get_color_resolution(),
+                depth_mode=self._get_depth_mode(),
+                synchronized_images_only=True
+            ),
+            device_id=self.device_index          
+        )
+        self.device.start()
+
+
+    def get_frame(self):
+        capture = self.device.get_capture()
+        if capture.color is None or capture.depth is None:
+            return None, None, None
+
+        color = capture.color
+        depth = capture.transformed_depth  # depth aligned to color
+
+    # Ensure 3-channel BGR for JPEG encoding
+        if color.ndim == 3 and color.shape[2] == 4:
+            color = cv2.cvtColor(color, cv2.COLOR_BGRA2BGR)
+
+        intr = self.get_intrinsics()
+        return color, depth, ds.CameraConfig(intr["fx"], intr["fy"], intr["ppx"], intr["ppy"])
+
+    def get_intrinsics(self):
+        calib: Calibration = self.device.calibration
+        cam = calib.get_camera_matrix(CalibrationType.COLOR)
+        fx = cam[0, 0]
+        fy = cam[1, 1]
+        ppx = cam[0, 2]
+        ppy = cam[1, 2]
+        return {
+            "fx": fx,
+            "fy": fy,
+            "ppx": ppx,
+            "ppy": ppy,
+            "matrix": cam.tolist()
+        }
+
+    def close(self):
+        if self.device is not None:
+            self.device.stop()
+
+    def _get_color_resolution(self):
+        # Map width x height to Azure Kinect color resolution
+        if self.width == 1280 and self.height == 720:
+            return ColorResolution.RES_720P
+        elif self.width == 1920 and self.height == 1080:
+            return ColorResolution.RES_1080P
         else:
-            self.next_ts_B = max(self.next_ts_B, now) + self.dt
-            ts = self.next_ts_B
-            rgb = self._gen_rgb(phase=ts*2.0+1.0)
-            depth = self._gen_depth(1400)
-        return Frame(rgb=rgb, depth=depth, ts_host_s=ts, w=self.w, h=self.h)
+            return ColorResolution.RES_720P  # default
 
-    def try_get_pair(self) -> PairedBundle | None:
-        fA = self._emit_one(0) if (time.time() >= self.next_ts_A) else None
-        fB = self._emit_one(1) if (time.time() >= self.next_ts_B) else None
-        if fA is not None:
-            self.bufA.append((fA.ts_host_s, fA))
-        if fB is not None:
-            self.bufB.append((fB.ts_host_s, fB))
-        if self.bufA and self.bufB:
-            ta, fa = self.bufA[0]
-            i, fb, dt = 0, None, 1e9
-            for j, (tb, gb) in enumerate(self.bufB):
-                d = abs(tb - ta)
-                if d < dt: i, fb, dt = j, gb, d
-            if dt <= self.tol:
-                self.bufA.popleft()
-                del self.bufB[i]
-                return PairedBundle(
-                    A=CamBundle(0, fa, self.intrA),
-                    B=CamBundle(1, fb, self.intrB),
-                    dt_ms=dt*1000.0
-                )
-        return None
+    def _get_depth_mode(self):
+        return DepthMode.WFOV_2X2BINNED # 640x576 (highest quality narrow FOV)
 
-    def close(self): pass
+    def apply_filters(self, depth_frame):
+        pass
+
+
+
+class CameraContext:
+    def __init__(self, strategy: Source):
+        self.strategy = strategy
+        self.is_camera = isinstance(strategy, CameraStrategy)
+
+    def init(self):
+        self.strategy.connect()
+
+    def get_frame(self):
+        rgb, depth, config = self.strategy.get_frame()
+        return rgb, depth, config
+
+    def apply_filters(self, depth_frame):
+        if self.is_camera:
+            return self.strategy.apply_filters(depth_frame)
+        else:
+            print("Filter not available for this source.")
+            return depth_frame
+
+    def get_intrinsics(self):
+        if self.is_camera:
+            return self.strategy.get_intrinsics()
+        else:
+            return None
+
+    def close(self):
+        self.strategy.close()
+
+
+
+class InternetStrategy(Source):
+    def __init__(self, address, port, width, height):
+        self.address = address
+        self.port = port
+        self.height = height
+        self.width = width
+
+    def connect(self):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PULL)
+        self.socket.connect(f"tcp://{self.address}:{self.port}")
+        # setsockopt(zmq.RCVHWM, 1) # Nur ein Paket empfangen
+        print(f"[INFO] Connected to ZMQ server on port {self.port}...")
+
+    def get_frame(self):
+        try:
+            print("read message")
+            packet = self.socket.recv()
+            print("read message finished")
+        except zmq.Again:
+            print("[WARN] No package available (recv timeout or non-blocking).")
+            return None, None
+        except zmq.ZMQError as e:
+            print(f"[ERROR] ZMQ error during reception: {e}")
+            return None, None
+
+        try:
+            offset = 0
+
+            # 1. RGB-Datenlänge (uint32)
+            rgb_len = struct.unpack_from('<I', packet, offset)[0]
+            offset += 4
+
+            # 2. RGB-Daten
+            rgb_bytes = packet[offset:offset + rgb_len]
+            offset += rgb_len
+
+            # 3. Depth-Datenlänge (uint32)
+            depth_len = struct.unpack_from('<I', packet, offset)[0]
+            offset += 4
+
+            # 4. Depth-Daten
+            depth_bytes = packet[offset:offset + depth_len]
+            offset += depth_len
+
+            # 5. Kamera-Parameter (4 float32)
+            fx, fy, cx, cy = struct.unpack_from('<4f', packet, offset)
+            offset += 16   
+            
+            print("read message")
+        except (struct.error, ValueError) as e:
+            print(f"[ERROR] Error parsing package: {e}")
+            return None, None
+
+        try:
+            # convert to nparray and adapt size
+            rgb_array = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape((self.height, self.width, 3))
+            rgb_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
+            depth_array = np.frombuffer(depth_bytes, dtype=np.uint16).reshape((self.height, self.width))
+        except ValueError as e:
+            print(f"[ERROR] Error converting image data: {e}")
+            return None, None
+        """
+        print("[INFO] Package successfully received and processed.")
+        print(f" - RGB-Shape: {rgb_array.shape}")
+        print(f" - Depth-Shape: {depth_array.shape}")
+        """
+        return rgb_array, depth_array, ds.CameraConfig(fx, fy, cx, cy)
+
+    def close(self):
+        self.socket.close()
+        self.context.term()
