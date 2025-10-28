@@ -1,8 +1,10 @@
-# Streamer.py — unified N-camera entrypoint (PointsPublisher-main)
-# - Reuses your repo's CameraContext + AzureKinectCameraStrategy
-# - Optional OpenCV preview windows (global.preview / global.preview_depth or CLI flags)
+# Streamer.py — unified N-camera entrypoint
+# - Reuses your repo's CameraContext + Strategy classes in streamer.Source
+# - Optional OpenCV preview windows (YAML or CLI flags)
 # - Sends v2 packets: header + optional intrinsics + optional pose
-# - Works with your (rgb, depth, config) frame format and ProcessingStep.process(rgb, depth)
+# - Applies ProcessingStep chain (Clamp → Median → ROI → Downsample)
+# - Adjusts intrinsics (fx,fy,cx,cy) for ROI/stride before sending
+# - Adds open-stagger per cam to improve multi-device boot (OAK)
 
 import sys, time, threading, yaml, inspect, argparse
 from pathlib import Path
@@ -10,9 +12,8 @@ import numpy as np
 import cv2
 import zmq
 
-# import your step builder + aliases
-from streamer.ProcessingStep import build_default_steps, Clamp, Median, ROICrop, Downsample
-
+# bring in your processing steps
+from streamer.ProcessingStep import build_default_steps
 
 # ========================= Packet v2 =========================
 
@@ -93,12 +94,11 @@ def load_pose_4x4(path: str | None) -> np.ndarray | None:
         print(f"[Pose] Failed to load {p}: {e}")
         return None
 
-# =================== Reuse your repo modules ===================
+# =================== Repo strategies / fallbacks ===================
 
 USE_EXISTING = True
 CameraContext = None
 AzureKinectStrategy = None
-# (Clamp/Median/ROICrop/Downsample already imported above)
 
 try:
     from streamer.Source import CameraContext as _CC
@@ -116,14 +116,13 @@ if USE_EXISTING:
         print(f"[Import] Could not import AzureKinectCameraStrategy from streamer.Source: {e}")
         USE_EXISTING = False
 
-# ========== Minimal Azure fallback (only if your strategy import fails) ==========
-
+# ---- Azure fallback (only if your repo strategy import fails) ----
 class _FallbackAzureK4A:
     def __init__(self, device_index=0, color_res=(1280,720), align_to_color=True):
         try:
             from pyk4a import PyK4A, Config, ColorResolution, DepthMode, ImageFormat, CalibrationType
         except Exception as e:
-            raise RuntimeError("pyk4a not installed and no existing AzureKinectStrategy found.") from e
+            raise RuntimeError("pyk4a not installed and no Azure strategy found.") from e
         self.PyK4A = PyK4A
         self.Config = Config
         self.ColorResolution = ColorResolution
@@ -157,7 +156,7 @@ class _FallbackAzureK4A:
         self._intr = np.array([fx, fy, cx, cy], dtype=np.float32)
         self._trans = getattr(self.k4a, "transformation", None)
         if self._trans is None and self.align:
-            print("[Azure] WARNING: PyK4A 'transformation' not available; sending UNALIGNED depth.")
+            print("[Azure] WARNING: 'transformation' not available; sending UNALIGNED depth.")
             self.align = False
 
     def close(self):
@@ -180,20 +179,105 @@ class _FallbackAzureK4A:
         cfg = _Cfg(); cfg.fx, cfg.fy, cfg.cx, cfg.cy = self._intr
         return bgr, depth.astype(np.uint16), cfg
 
-# ====================== Simple Preview Hub (RGB + Depth) ======================
+# ---- OAK fallback (used only if your repo lacks LuxonisCameraStrategy) ----
+class _FallbackLuxonisOAK:
+    def __init__(self, mxid=None, device_index=0, color_res=(1280,720), align_to_color=True, usb2mode=False):
+        import depthai as dai
+        self.dai = dai
+        self.mxid = mxid
+        self.device_index = int(device_index)
+        self.w, self.h = map(int, color_res)
+        self.align = bool(align_to_color)
+        self.usb2 = bool(usb2mode)
+        self.dev = None
+        self.qRgb = None
+        self.qDepth = None
+        self._intr = None
+
+    def open(self):
+        dai = self.dai
+        p = dai.Pipeline()
+
+        cam_rgb = p.create(dai.node.ColorCamera)
+        cam_rgb.setBoardSocket(dai.CameraBoardSocket.RGB)
+        cam_rgb.setPreviewSize(self.w, self.h)
+        cam_rgb.setInterleaved(False)
+        cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        cam_rgb.setFps(30)
+
+        mono_l = p.create(dai.node.MonoCamera)
+        mono_r = p.create(dai.node.MonoCamera)
+        mono_l.setBoardSocket(dai.CameraBoardSocket.LEFT)
+        mono_r.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+        mono_l.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
+        mono_r.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
+        mono_l.setFps(30); mono_r.setFps(30)
+
+        stereo = p.create(dai.node.StereoDepth)
+        try: PM = dai.node.StereoDepth.PresetMode
+        except AttributeError: PM = dai.StereoDepth.PresetMode
+        stereo.setDefaultProfilePreset(PM.MEDIUM_DENSITY)
+        stereo.setMedianFilter(dai.MedianFilter.MEDIAN_OFF)
+        stereo.setExtendedDisparity(False)
+        stereo.setSubpixel(False)
+        stereo.setLeftRightCheck(False)
+        if self.align:
+            stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
+        stereo.setOutputSize(self.w, self.h)
+
+        mono_l.out.link(stereo.left)
+        mono_r.out.link(stereo.right)
+
+        xout_rgb = p.create(dai.node.XLinkOut); xout_rgb.setStreamName("rgb")
+        xout_d   = p.create(dai.node.XLinkOut); xout_d.setStreamName("depth")
+        cam_rgb.preview.link(xout_rgb.input)
+        stereo.depth.link(xout_d.input)
+
+        if self.mxid:
+            info = dai.DeviceInfo(self.mxid)
+            self.dev = dai.Device(p, info, usb2Mode=self.usb2)
+        else:
+            devs = dai.Device.getAllAvailableDevices()
+            if not devs:
+                raise RuntimeError("No OAK devices found.")
+            info = devs[min(self.device_index, len(devs)-1)]
+            self.dev = dai.Device(p, info, usb2Mode=self.usb2)
+
+        self.qRgb   = self.dev.getOutputQueue("rgb",   maxSize=2, blocking=False)
+        self.qDepth = self.dev.getOutputQueue("depth", maxSize=2, blocking=False)
+
+        calib = self.dev.readCalibration()
+        K = calib.getCameraIntrinsics(dai.CameraBoardSocket.RGB, self.w, self.h)
+        fx, fy, cx, cy = float(K[0][0]), float(K[1][1]), float(K[0][2]), float(K[1][2])
+        self._intr = np.array([fx, fy, cx, cy], dtype=np.float32)
+
+    def close(self):
+        if self.dev is not None:
+            self.dev.close()
+            self.dev = None
+
+    def get_frame(self):
+        rgb_pkt = self.qRgb.tryGet()
+        d_pkt   = self.qDepth.tryGet()
+        if rgb_pkt is None or d_pkt is None:
+            return None
+        bgr   = rgb_pkt.getCvFrame()
+        depth = d_pkt.getFrame().copy()
+        if depth.shape[:2] != bgr.shape[:2]:
+            depth = cv2.resize(depth, (bgr.shape[1], bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+        class _Cfg: pass
+        cfg = _Cfg(); cfg.fx, cfg.fy, cfg.cx, cfg.cy = self._intr
+        return bgr, depth.astype(np.uint16), cfg
+
+# ====================== Preview (RGB + Depth) ======================
 
 def _resolve_colormap_code(name_or_code):
-    # Accept int code or string name; fallback to JET
     if isinstance(name_or_code, int):
         return int(name_or_code)
     name = str(name_or_code).strip().upper()
     return getattr(cv2, f"COLORMAP_{name}", cv2.COLORMAP_JET)
 
 def _colorize_depth_mm(depth_u16: np.ndarray, dmin: int, dmax: int, cmap_code: int) -> np.ndarray:
-    """
-    depth_u16: uint16 in millimetres, HxW
-    returns: BGR uint8 HxWx3 colorized image
-    """
     d = np.asarray(depth_u16, dtype=np.float32)
     valid = d > 0
     lo, hi = float(dmin), float(max(dmax, dmin + 1))
@@ -213,8 +297,8 @@ class PreviewHub(threading.Thread):
         self.enabled_depth = False
         self._run = False
         self._lock = threading.Lock()
-        self._rgb = {}    # cam_id -> BGR
-        self._depth = {}  # cam_id -> BGR depth colorized
+        self._rgb = {}
+        self._depth = {}
 
     def enable(self, rgb: bool, depth: bool):
         self.enabled_rgb = bool(rgb)
@@ -276,7 +360,6 @@ class ZmqPublisherV2:
         """Return (bgr, rgb_jpeg_or_None, depth_u16, (w,h), intr[4] or None, ts_us)."""
         bgr = None; jpg = None; depth = None; size = None; intr = None; ts = None
 
-        # Your repo: (rgb, depth, config)
         if isinstance(frame, tuple) and len(frame) == 3:
             bgr, depth, cfg = frame
             if bgr is not None:
@@ -288,7 +371,6 @@ class ZmqPublisherV2:
             if hasattr(cfg, "timestamp_us"):
                 ts = int(cfg.timestamp_us)
 
-        # Fallbacks (dict-like / attribute-like)
         if isinstance(frame, dict):
             bgr   = frame.get("bgr") or frame.get("rgb") or frame.get("color") or bgr
             jpg   = frame.get("rgb_jpeg") or frame.get("jpeg") or jpg
@@ -297,21 +379,6 @@ class ZmqPublisherV2:
             size  = size or (wh if wh is not None else (frame.get("width"), frame.get("height")))
             intr  = frame.get("intrinsics") or frame.get("intr") or intr
             ts    = frame.get("timestamp_us") or frame.get("ts_us") or ts
-
-        for name in ("bgr","rgb","color"):
-            if bgr is None and hasattr(frame, name): bgr = getattr(frame, name)
-        for name in ("rgb_jpeg","jpeg"):
-            if jpg is None and hasattr(frame, name): jpg = getattr(frame, name)
-        for name in ("depth_u16","depth"):
-            if depth is None and hasattr(frame, name): depth = getattr(frame, name)
-        if size is None:
-            if hasattr(frame, "size"): size = getattr(frame, "size")
-            elif hasattr(frame, "width") and hasattr(frame, "height"):
-                size = (getattr(frame, "width"), getattr(frame, "height"))
-        for name in ("intrinsics","intr"):
-            if intr is None and hasattr(frame, name): intr = getattr(frame, name)
-        for name in ("timestamp_us","ts_us"):
-            if ts is None and hasattr(frame, name): ts = getattr(frame, name)
 
         if size is None:
             if bgr is not None: h, w = bgr.shape[:2]; size = (w, h)
@@ -348,42 +415,6 @@ class ZmqPublisherV2:
         except zmq.Again:
             pass
 
-# ================= Strategy factory & helpers =================
-
-def _safe_construct(cls, **kwargs):
-    sig = inspect.signature(cls.__init__)
-    allowed = {k:v for k,v in kwargs.items() if k in sig.parameters}
-    try:
-        return cls(**allowed) if allowed else cls()
-    except Exception:
-        return cls()
-
-def make_strategy(cam_cfg: dict, global_cfg: dict):
-    cam_type = str(cam_cfg.get("type", "azure")).lower()
-    color_res = tuple(cam_cfg.get("color_res", [1280, 720]))
-    align_to_color = bool(global_cfg.get("align_to_color", True))
-
-    if cam_type == "azure":
-        if USE_EXISTING and CameraContext and AzureKinectStrategy:
-            w, h = color_res
-            return _safe_construct(
-                AzureKinectStrategy,
-                width=w, height=h,
-                color_res=color_res,
-                device_index=cam_cfg.get("device", 0),
-                device=cam_cfg.get("device", 0),
-                align_to_color=align_to_color,
-                align=align_to_color
-            )
-        return _FallbackAzureK4A(device_index=cam_cfg.get("device", 0),
-                                 color_res=color_res, align_to_color=align_to_color)
-
-    raise ValueError(f"Unknown camera type: {cam_type}")
-
-def resolve_port(cam_cfg: dict, base_port: int) -> int:
-    p = cam_cfg.get("port")
-    return int(p) if p is not None else int(base_port) + (int(cam_cfg["id"]) - 1)
-
 # ================= Intrinsics helpers (ROI / stride adjustment) =================
 
 def _intr_get(i):
@@ -417,6 +448,82 @@ def _adjust_intrinsics_for_roi_stride(intr, global_cfg):
         fx /= s; fy /= s; cx /= s; cy /= s
     return _intr_set(intr, fx, fy, cx, cy, kind)
 
+# ================= Strategy factory =================
+
+def _safe_construct(cls, **kwargs):
+    sig = inspect.signature(cls.__init__)
+    allowed = {k:v for k,v in kwargs.items() if k in sig.parameters}
+    try:
+        return cls(**allowed) if allowed else cls()
+    except Exception:
+        return cls()
+
+def make_strategy(cam_cfg: dict, global_cfg: dict):
+    cam_type = str(cam_cfg.get("type", "azure")).lower()
+    color_res = tuple(cam_cfg.get("color_res", [1280, 720]))
+    align_to_color = bool(global_cfg.get("align_to_color", True))
+    usb2mode = bool(cam_cfg.get("usb2mode", False))
+
+    if cam_type in ("azure", "k4a"):
+        if USE_EXISTING and CameraContext and AzureKinectStrategy:
+            w, h = color_res
+            return _safe_construct(
+                AzureKinectStrategy,
+                width=w, height=h,
+                color_res=color_res,
+                device_index=cam_cfg.get("device", 0),
+                device=cam_cfg.get("device", 0),
+                align_to_color=align_to_color,
+                align=align_to_color
+            )
+        return _FallbackAzureK4A(device_index=cam_cfg.get("device", 0),
+                                 color_res=color_res, align_to_color=align_to_color)
+
+    if cam_type in ("oak", "oakd", "luxonis"):
+        try:
+            from streamer.Source import LuxonisCameraStrategy as _LXS
+            w, h = color_res
+            # Prefer MXID for multi-device
+            return _safe_construct(
+                _LXS,
+                width=w, height=h,
+                color_res=color_res,
+                mxid=cam_cfg.get("mxid", None),
+                device=cam_cfg.get("device", 0),
+                device_index=cam_cfg.get("device", 0),
+                usb2mode=usb2mode,
+            )
+        except Exception:
+            return _FallbackLuxonisOAK(
+                mxid=cam_cfg.get("mxid", None),
+                device_index=cam_cfg.get("device", 0),
+                color_res=color_res,
+                align_to_color=align_to_color,
+                usb2mode=usb2mode,
+            )
+
+    if cam_type in ("dummy", "sim", "test"):
+        from streamer.Source import DummyCameraStrategy as _DCS
+        w, h = color_res
+        return _safe_construct(
+            _DCS,
+            width=w, height=h,
+            color_res=color_res,
+            fov_deg=cam_cfg.get("fov_deg", 70.0),
+            pattern=cam_cfg.get("pattern", "checker"),
+            z_mm=cam_cfg.get("z_mm", 1500),
+            amp_mm=cam_cfg.get("amp_mm", 250),
+            period_s=cam_cfg.get("period_s", 4.0),
+            seed=cam_cfg.get("seed", None),
+            align_to_color=align_to_color
+        )
+
+    raise ValueError(f"Unknown camera type: {cam_type}")
+
+def resolve_port(cam_cfg: dict, base_port: int) -> int:
+    p = cam_cfg.get("port")
+    return int(p) if p is not None else int(base_port) + (int(cam_cfg["id"]) - 1)
+
 # ======================== Pipeline worker ========================
 
 class CameraPipeline(threading.Thread):
@@ -447,18 +554,21 @@ class CameraPipeline(threading.Thread):
         self.global_cfg = global_cfg
         self.strategy = make_strategy(cam_cfg, global_cfg)
 
+        # Decide how to interact (context or direct)
         if CameraContext and hasattr(CameraContext, "__call__"):
             self.ctx = CameraContext(self.strategy)
             self._grab  = self.ctx.get_frame
-            self._open  = getattr(self.ctx, "init", getattr(self.ctx, "open", getattr(self.ctx, "connect", None)))
+            self._open  = getattr(self.ctx, "init", getattr(self.ctx, "connect", getattr(self.ctx, "open", None)))
             self._close = getattr(self.ctx, "close", lambda: None)
         else:
             self.ctx = self.strategy
             self._grab  = getattr(self.ctx, "get_frame", None)
-            self._open  = getattr(self.ctx, "open", None)
+            self._open  = getattr(self.ctx, "connect", getattr(self.ctx, "open", None))
             self._close = getattr(self.ctx, "close", lambda: None)
 
+        # Build processing steps chain from YAML
         self.steps = build_default_steps(global_cfg)
+
         self.pub = ZmqPublisherV2(
             port=self.port, camera_id=self.cam_id, pose_4x4=self.pose,
             jpeg_quality=int(global_cfg.get("jpeg_quality", 80)),
@@ -467,9 +577,13 @@ class CameraPipeline(threading.Thread):
         self._fps_t0 = time.time()
         self._fps_n = 0
         self._next_deadline = time.time()
+        self.startup_delay_s = float(global_cfg.get("open_stagger_ms", 600)) * 0.001 * (self.cam_id - 1)
 
     def run(self):
         try:
+            # stagger opening per cam to avoid multi-device boot contention
+            if self.startup_delay_s > 0:
+                time.sleep(self.startup_delay_s)
             if self._open: self._open()
         except Exception as e:
             print(f"[Cam{self.cam_id}] FAILED to open device on port {self.port}: {e}")
@@ -481,7 +595,6 @@ class CameraPipeline(threading.Thread):
                 if tup is None:
                     continue
 
-                # (rgb, depth, config)
                 if isinstance(tup, tuple) and len(tup) == 3:
                     rgb, depth, cfg = tup
 
@@ -498,7 +611,7 @@ class CameraPipeline(threading.Thread):
                     except Exception:
                         pass
 
-                    # Depth preview (colorized)
+                    # Depth preview
                     depth_bgr = None
                     if self.preview_depth and depth is not None:
                         depth_bgr = _colorize_depth_mm(depth, self.depth_min_mm, self.depth_max_mm, self.depth_cmap_code)
@@ -510,7 +623,6 @@ class CameraPipeline(threading.Thread):
                     # Send
                     self.pub.push((rgb, depth, cfg))
                 else:
-                    # Unknown layout; still attempt to push
                     self.pub.push(tup)
 
                 self._fps_n += 1
@@ -557,7 +669,7 @@ def main():
               "  base_port: 5555\n  jpeg_quality: 80\n  fps_max: 30\n  send_intrinsics: true\n  align_to_color: true\n"
               "  pose_dir: ./poses\n  preview: false\n  preview_depth: false\n  depth_min_mm: 400\n  depth_max_mm: 6000\n  depth_colormap: JET\n"
               "cameras:\n"
-              "  - id: 1\n    type: azure\n    device: 0\n    port: 5555\n    color_res: [1280, 720]\n")
+              "  - id: 1\n    type: oak\n    mxid: \"YOUR_DEVICE_MXID\"\n    port: 5555\n    color_res: [1280, 720]\n")
         sys.exit(1)
 
     cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))

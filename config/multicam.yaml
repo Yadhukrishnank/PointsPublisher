@@ -1,27 +1,79 @@
 global:
-  base_port: 5555            # Cam1→5555, Cam2→5556
+  base_port: 5555
   jpeg_quality: 80
   send_intrinsics: true
   align_to_color: true
-  preview: false             # set true for quick OpenCV windows
+  preview: false
   pose_dir: ./poses
   depth_min_mm: 400
   depth_max_mm: 6000
   roi_xywh: [160, 90, 960, 540]
-  downsample_stride: 3           # 1=no DS, 2=quarter pixels, 3≈1/9th
-  median_ksize: 3                 # optional denoise; 0 disables
+  downsample_stride: 2
+  median_ksize: 3
+  open_stagger_ms: 600
+           
 
 cameras:
+  # - id: 1
+  #   type: azure
+  #   device: 0
+  #   port: 5555
+  #   color_res: [1280, 720]
+  #   pose_file: "C:/Users/yadhu/PointsPublisher/poses/cam1_Twc.txt"
+
+  # - id: 2
+  #   type: azure
+  #   device: 1
+  #   port: 5556
+  #   color_res: [1280, 720]
+  #   pose_file: "C:/Users/yadhu/PointsPublisher/poses/cam2_Twc.txt"
+
   - id: 1
-    type: azure
-    device: 0
+    type: oak                 
+    mxid: "184430102111900E00"
     port: 5555
-    color_res: [1280, 720]
-    pose_file: "C:/Users/yadhu/PointsPublisher/poses/cam1_Twc.txt"
+    color_res: [640, 360]
+    pose_file: "C:/Users/yadhu/PointsPublisher/poses/extrinsics_184430102111900E00_T_wc.txt"
 
   - id: 2
-    type: azure
-    device: 1
+    type: oak
+    mxid: "19443010B11CEF1200"
     port: 5556
-    color_res: [1280, 720]
-    pose_file: "C:/Users/yadhu/PointsPublisher/poses/cam2_Twc.txt"
+    color_res: [640, 360]
+    pose_file: "C:/Users/yadhu/PointsPublisher/poses/extrinsics_19443010B11CEF1200_T_wc.txt"
+
+    # - id: 1
+    #   type: dummy
+    #   port: 5555
+    #   color_res: [1280, 720]
+    #   fov_deg: 70
+    #   pattern: checker
+    #   z_mm: 1500
+    #   amp_mm: 300
+    #   period_s: 5.0
+    #   # Optional test pose (push left)
+    #   pose_file: "C:/Users/yadhu/PointsPublisher/poses/cam1.npz"
+
+    # - id: 2
+    #   type: dummy
+    #   port: 5556
+    #   color_res: [1280, 720]
+    #   fov_deg: 70
+    #   pattern: checker
+    #   z_mm: 1700
+    #   amp_mm: 200
+    #   period_s: 6.0
+    #   # Optional test pose (push right)
+    #   pose_file: "C:/Users/yadhu/PointsPublisher/poses/cam2.npz"
+
+    # - id: 3
+    #   type: dummy
+    #   port: 5557
+    #   color_res: [1280, 720]
+    #   fov_deg: 70
+    #   pattern: checker
+    #   z_mm: 1700
+    #   amp_mm: 200
+    #   period_s: 6.0
+    #   # Optional test pose (push right)
+    #   pose_file: "C:/Users/yadhu/PointsPublisher/poses/cam3_Twc.txt"
