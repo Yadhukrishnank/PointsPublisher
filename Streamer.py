@@ -1,66 +1,14 @@
-# Streamer.py — unified N-camera entrypoint
-# - Reuses your repo's CameraContext + Strategy classes in streamer.Source
-# - Optional OpenCV preview windows (YAML or CLI flags)
-# - Sends v2 packets: header + optional intrinsics + optional pose
-# - Applies ProcessingStep chain (Clamp → Median → ROI → Downsample)
-# - Adjusts intrinsics (fx,fy,cx,cy) for ROI/stride before sending
-# - Adds open-stagger per cam to improve multi-device boot (OAK)
-
+# Entry point
 import sys, time, threading, yaml, inspect, argparse
 from pathlib import Path
 import numpy as np
 import cv2
 import zmq
+import socket, struct, json
 
-# bring in your processing steps
 from streamer.ProcessingStep import build_default_steps
-
-# ========================= Packet v2 =========================
-
-MAGIC = 0xABCD1234
-VERSION = 2
-FLAG_POSE = 1   # bit0
-FLAG_INTR = 2   # bit1
-
-class PacketV2Writer:
-    """
-    Layout (little-endian):
-    [Header 36B]: u32 MAGIC, u16 VERSION, u16 flags, u32 camera_id, u64 ts_us, u32 w, u32 h, u32 rgb_len, u32 depth_len
-    [Intrinsics 16B] if flags&FLAG_INTR: float32[4] = fx,fy,cx,cy
-    [RGB JPEG rgb_len B]
-    [Depth U16 depth_len B] (aligned to color, mm)
-    [Pose 4x4 64B] if flags&FLAG_POSE: float32[16] row-major world<-camera (T_wc)
-    """
-    def __init__(self, send_intrinsics: bool = True):
-        self.send_intrinsics = send_intrinsics
-
-    def pack(self, camera_id: int, timestamp_us: int, width: int, height: int,
-             rgb_jpeg_bytes: bytes, depth_u16: np.ndarray,
-             intrinsics: np.ndarray | None, pose_Twc: np.ndarray | None) -> bytes:
-        import struct
-        flags = 0
-        if pose_Twc is not None:
-            flags |= FLAG_POSE
-        if self.send_intrinsics and intrinsics is not None:
-            flags |= FLAG_INTR
-
-        depth_u16 = np.asarray(depth_u16, dtype=np.uint16)
-        depth_bytes = depth_u16.tobytes(order="C")
-
-        header = struct.pack("<IHHI Q I I I I",
-                             MAGIC, VERSION, flags, int(camera_id),
-                             int(timestamp_us), int(width), int(height),
-                             len(rgb_jpeg_bytes), len(depth_bytes))
-        parts = [header]
-        if flags & FLAG_INTR:
-            intr = np.asarray(intrinsics, dtype=np.float32).reshape(4)
-            parts.append(struct.pack("<4f", *intr))
-        parts.append(rgb_jpeg_bytes)
-        parts.append(depth_bytes)
-        if flags & FLAG_POSE:
-            T = np.asarray(pose_Twc, dtype=np.float32).reshape(16)
-            parts.append(struct.pack("<16f", *T))
-        return b"".join(parts)
+from streamer.net.PacketV2 import PacketV2Writer, MAGIC, VERSION, FLAG_POSE, FLAG_INTR
+from streamer.Actions import PREVIEW, ZmqPublisherV2, _resolve_colormap_code, _colorize_depth_mm
 
 # ====================== Pose loader (optional) ======================
 
@@ -74,25 +22,133 @@ def load_pose_4x4(path: str | None) -> np.ndarray | None:
     try:
         if p.suffix.lower() == ".npz":
             data = np.load(p)
+            # try common keys
             for key in ("T_wc", "pose", "T", "matrix", "M"):
                 if key in data and data[key].shape == (4, 4):
                     return data[key].astype(np.float32)
+            # handle R / t case
             if "R" in data and "t" in data:
                 T = np.eye(4, dtype=np.float32)
-                T[:3,:3] = data["R"].reshape(3,3)
+                T[:3, :3] = data["R"].reshape(3, 3)
                 T[:3,  3] = data["t"].reshape(3)
                 return T
             print(f"[Pose] {p.name}: no 4x4 key (expected T_wc/pose/T/matrix/M)")
             return None
+        # fallback: txt or raw .npy
         try:
-            T = np.loadtxt(p, dtype=np.float32).reshape(4,4)
+            T = np.loadtxt(p, dtype=np.float32).reshape(4, 4)
             return T
         except Exception:
-            T = np.load(p).astype(np.float32).reshape(4,4)
+            T = np.load(p).astype(np.float32).reshape(4, 4)
             return T
     except Exception as e:
         print(f"[Pose] Failed to load {p}: {e}")
         return None
+
+def pose_to_unity_coords(T_cam_to_cal: np.ndarray | None) -> np.ndarray | None:
+    """
+    Convert pose from calibration world (X right, Y forward, Z up)
+    into Unity world (X right, Y up, Z forward).
+
+    We do this by swapping Y and Z axes of the world frame before sending.
+    """
+    if T_cam_to_cal is None:
+        return None
+
+    axis_swap = np.array([
+        [1,0,0,0],
+        [0,0,1,0],
+        [0,1,0,0],
+        [0,0,0,1],
+    ], dtype=np.float32)
+
+    # camera -> unityWorld = axis_swap * (camera -> calibWorld)
+    T_cam_to_unity = axis_swap @ T_cam_to_cal
+    return T_cam_to_unity.astype(np.float32)
+
+
+# ===================================================================
+# =========== Quest/Unity auto-discovery responder ==================
+# ===================================================================
+#
+# The Quest/Unity side (MultiZmqFrameReceiver.cs) will:
+#  1. Broadcast UDP "DISCOVER_ZMQ_SERVER" to discoveryPort (default 5554)
+#  2. Wait for a reply "ZMQ_SERVER_HERE"
+#  3. Use the sender IP of that reply as 'host' for all ZMQ PULL sockets
+#
+# This thread is what answers that broadcast so the Quest never needs
+# a hardcoded PC IP.
+
+def _udp_discovery_worker(listen_port: int):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # allow quick restart without "address already in use"
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", listen_port))
+    print(f"[discovery] UDP responder listening on *:{listen_port}")
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+            msg = data.decode("ascii", errors="ignore").strip()
+            if msg == "DISCOVER_ZMQ_SERVER":
+                # reply directly (unicast back to Quest/Unity caller)
+                sock.sendto(b"ZMQ_SERVER_HERE", addr)
+                print(f"[discovery] reply -> {addr[0]}:{addr[1]}")
+        except Exception as e:
+            # don't kill the whole responder on random socket hiccups
+            print(f"[discovery] error: {e}")
+            time.sleep(0.1)
+
+def start_udp_discovery_responder(port: int):
+    t = threading.Thread(
+        target=_udp_discovery_worker,
+        args=(port,),
+        daemon=True
+    )
+    t.start()
+    return t
+
+# ------------------ IRIS / scene auto-spawn helpers ------------------
+# (kept as-is; harmless if you don't use IRIS)
+
+MCAST_GRP  = "239.255.10.10"
+MCAST_PORT = 7720
+
+def discover_iris_unity(timeout: float = 3.0, iface_ip: str = "0.0.0.0") -> dict:
+    """
+    Listen for one IRISXRNode heartbeat and return
+    {'ip','port','node_id','node_info_id'}.
+    Unity/Quest broadcasts: nodeID(36) + nodeInfoID(36) + port(as text).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", MCAST_PORT))
+
+    # join multicast group
+    mreq = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton(iface_ip))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    sock.settimeout(timeout)
+
+    try:
+        data, (ip, _src_port) = sock.recvfrom(1024)
+    finally:
+        sock.close()
+
+    s = data.decode("utf-8", errors="ignore")
+    node_id      = s[:36]
+    node_info_id = s[36:72]
+    port         = int(s[72:])
+    return {"ip": ip, "port": port, "node_id": node_id, "node_info_id": node_info_id}
+
+def spawn_sim_scene(ip: str, port: int, scene_name: str = "PointClouds") -> None:
+    ctx  = zmq.Context.instance()
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, 3000)   # 3s timeout
+    sock.connect(f"tcp://{ip}:{int(port)}")
+    payload = json.dumps({"name": scene_name}).encode("utf-8")
+    print(f"[IRIS] -> SpawnSimScene to {ip}:{port} name={scene_name}")
+    sock.send_multipart([b"SpawnSimScene", payload])
+    reply = sock.recv()                   # raises if timeout
+    print(f"[IRIS] <- {reply.decode('utf-8', 'ignore')}")
 
 # =================== Repo strategies / fallbacks ===================
 
@@ -116,7 +172,7 @@ if USE_EXISTING:
         print(f"[Import] Could not import AzureKinectCameraStrategy from streamer.Source: {e}")
         USE_EXISTING = False
 
-# ---- Azure fallback (only if your repo strategy import fails) ----
+# ---- Azure fallback (only used if repo strategy can't be imported) ----
 class _FallbackAzureK4A:
     def __init__(self, device_index=0, color_res=(1280,720), align_to_color=True):
         try:
@@ -151,9 +207,12 @@ class _FallbackAzureK4A:
         )
         self.k4a = self.PyK4A(cfg, device_id=self.device_index)
         self.k4a.start()
+
+        # intrinsics
         K = self.k4a.calibration.get_camera_matrix(self.CalibrationType.COLOR)
         fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
         self._intr = np.array([fx, fy, cx, cy], dtype=np.float32)
+
         self._trans = getattr(self.k4a, "transformation", None)
         if self._trans is None and self.align:
             print("[Azure] WARNING: 'transformation' not available; sending UNALIGNED depth.")
@@ -168,18 +227,21 @@ class _FallbackAzureK4A:
         cap = self.k4a.get_capture()
         if cap is None or cap.color is None or cap.depth is None:
             return None
+
         depth = cap.depth
         if self.align and self._trans is not None:
             depth = self._trans.depth_image_to_color_camera(depth)
+
         bgr = cv2.cvtColor(cap.color, cv2.COLOR_BGRA2BGR)
         h, w = bgr.shape[:2]
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+
         class _Cfg: pass
         cfg = _Cfg(); cfg.fx, cfg.fy, cfg.cx, cfg.cy = self._intr
         return bgr, depth.astype(np.uint16), cfg
 
-# ---- OAK fallback (used only if your repo lacks LuxonisCameraStrategy) ----
+# ---- OAK fallback (only used if repo Luxonis strategy can't be imported) ----
 class _FallbackLuxonisOAK:
     def __init__(self, mxid=None, device_index=0, color_res=(1280,720), align_to_color=True, usb2mode=False):
         import depthai as dai
@@ -198,6 +260,7 @@ class _FallbackLuxonisOAK:
         dai = self.dai
         p = dai.Pipeline()
 
+        # RGB camera node
         cam_rgb = p.create(dai.node.ColorCamera)
         cam_rgb.setBoardSocket(dai.CameraBoardSocket.RGB)
         cam_rgb.setPreviewSize(self.w, self.h)
@@ -205,34 +268,51 @@ class _FallbackLuxonisOAK:
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam_rgb.setFps(30)
 
+        # Mono cameras for stereo depth
         mono_l = p.create(dai.node.MonoCamera)
         mono_r = p.create(dai.node.MonoCamera)
         mono_l.setBoardSocket(dai.CameraBoardSocket.LEFT)
         mono_r.setBoardSocket(dai.CameraBoardSocket.RIGHT)
         mono_l.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
         mono_r.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
-        mono_l.setFps(30); mono_r.setFps(30)
+        mono_l.setFps(30)
+        mono_r.setFps(30)
 
+        # Stereo depth
         stereo = p.create(dai.node.StereoDepth)
-        try: PM = dai.node.StereoDepth.PresetMode
-        except AttributeError: PM = dai.StereoDepth.PresetMode
+        try:
+            PM = dai.node.StereoDepth.PresetMode
+        except AttributeError:
+            # depthai 2.x style
+            PM = dai.StereoDepth.PresetMode
+
         stereo.setDefaultProfilePreset(PM.MEDIUM_DENSITY)
         stereo.setMedianFilter(dai.MedianFilter.MEDIAN_OFF)
         stereo.setExtendedDisparity(False)
         stereo.setSubpixel(False)
         stereo.setLeftRightCheck(False)
+
+        # Align to RGB if requested
         if self.align:
             stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
+
+        # Force output size == rgb preview size, so rgb/depth match
         stereo.setOutputSize(self.w, self.h)
 
+        # Link mono → stereo
         mono_l.out.link(stereo.left)
         mono_r.out.link(stereo.right)
 
-        xout_rgb = p.create(dai.node.XLinkOut); xout_rgb.setStreamName("rgb")
-        xout_d   = p.create(dai.node.XLinkOut); xout_d.setStreamName("depth")
+        # XLink outputs for rgb/depth
+        xout_rgb = p.create(dai.node.XLinkOut)
+        xout_rgb.setStreamName("rgb")
         cam_rgb.preview.link(xout_rgb.input)
+
+        xout_d = p.create(dai.node.XLinkOut)
+        xout_d.setStreamName("depth")
         stereo.depth.link(xout_d.input)
 
+        # Create device
         if self.mxid:
             info = dai.DeviceInfo(self.mxid)
             self.dev = dai.Device(p, info, usb2Mode=self.usb2)
@@ -240,12 +320,14 @@ class _FallbackLuxonisOAK:
             devs = dai.Device.getAllAvailableDevices()
             if not devs:
                 raise RuntimeError("No OAK devices found.")
-            info = devs[min(self.device_index, len(devs)-1)]
+            info = devs[min(self.device_index, len(devs) - 1)]
             self.dev = dai.Device(p, info, usb2Mode=self.usb2)
 
+        # Output queues
         self.qRgb   = self.dev.getOutputQueue("rgb",   maxSize=2, blocking=False)
         self.qDepth = self.dev.getOutputQueue("depth", maxSize=2, blocking=False)
 
+        # Intrinsics from calibration
         calib = self.dev.readCalibration()
         K = calib.getCameraIntrinsics(dai.CameraBoardSocket.RGB, self.w, self.h)
         fx, fy, cx, cy = float(K[0][0]), float(K[1][1]), float(K[0][2]), float(K[1][2])
@@ -261,161 +343,19 @@ class _FallbackLuxonisOAK:
         d_pkt   = self.qDepth.tryGet()
         if rgb_pkt is None or d_pkt is None:
             return None
+
         bgr   = rgb_pkt.getCvFrame()
         depth = d_pkt.getFrame().copy()
+
         if depth.shape[:2] != bgr.shape[:2]:
-            depth = cv2.resize(depth, (bgr.shape[1], bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+            depth = cv2.resize(depth, (bgr.shape[1], bgr.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+
         class _Cfg: pass
         cfg = _Cfg(); cfg.fx, cfg.fy, cfg.cx, cfg.cy = self._intr
         return bgr, depth.astype(np.uint16), cfg
 
-# ====================== Preview (RGB + Depth) ======================
-
-def _resolve_colormap_code(name_or_code):
-    if isinstance(name_or_code, int):
-        return int(name_or_code)
-    name = str(name_or_code).strip().upper()
-    return getattr(cv2, f"COLORMAP_{name}", cv2.COLORMAP_JET)
-
-def _colorize_depth_mm(depth_u16: np.ndarray, dmin: int, dmax: int, cmap_code: int) -> np.ndarray:
-    d = np.asarray(depth_u16, dtype=np.float32)
-    valid = d > 0
-    lo, hi = float(dmin), float(max(dmax, dmin + 1))
-    d = np.clip(d, lo, hi)
-    norm = (d - lo) * (255.0 / (hi - lo))
-    norm[~valid] = 0.0
-    img8 = norm.astype(np.uint8)
-    cm = cv2.applyColorMap(img8, cmap_code)
-    cm[~valid] = (0, 0, 0)
-    return cm
-
-class PreviewHub(threading.Thread):
-    """Single UI thread showing latest RGB and Depth per camera. ESC closes windows."""
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.enabled_rgb = False
-        self.enabled_depth = False
-        self._run = False
-        self._lock = threading.Lock()
-        self._rgb = {}
-        self._depth = {}
-
-    def enable(self, rgb: bool, depth: bool):
-        self.enabled_rgb = bool(rgb)
-        self.enabled_depth = bool(depth)
-        if (self.enabled_rgb or self.enabled_depth) and not self._run:
-            self._run = True
-            self.start()
-
-    def update(self, cam_id: int, bgr: np.ndarray | None, depth_bgr: np.ndarray | None):
-        if not self._run:
-            return
-        with self._lock:
-            if self.enabled_rgb and bgr is not None:
-                self._rgb[cam_id] = bgr
-            if self.enabled_depth and depth_bgr is not None:
-                self._depth[cam_id] = depth_bgr
-
-    def run(self):
-        while self._run:
-            imgs = []
-            with self._lock:
-                if self.enabled_rgb:
-                    imgs.extend(("RGB", cid, img) for cid, img in self._rgb.items())
-                if self.enabled_depth:
-                    imgs.extend(("Depth", cid, img) for cid, img in self._depth.items())
-            for kind, cid, img in imgs:
-                cv2.imshow(f"{kind} - Cam {cid}", img)
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC
-                self._run = False
-                break
-        cv2.destroyAllWindows()
-
-PREVIEW = PreviewHub()
-
-# =================== ZMQ publisher (v2) ===================
-
-class ZmqPublisherV2:
-    def __init__(self, port: int, camera_id: int, pose_4x4: np.ndarray | None,
-                 jpeg_quality: int = 80, send_intrinsics: bool = True,
-                 bind_host: str = "0.0.0.0"):
-        self.camera_id = int(camera_id)
-        self.pose_4x4 = pose_4x4
-        self.jpeg_quality = int(jpeg_quality)
-        self.packet = PacketV2Writer(send_intrinsics=send_intrinsics)
-        ctx = zmq.Context.instance()
-        self.sock = ctx.socket(zmq.PUSH)
-        self.sock.setsockopt(zmq.SNDHWM, 2)
-        self.sock.setsockopt(zmq.LINGER, 0)
-        self.addr = f"tcp://{bind_host}:{int(port)}"
-        self.sock.bind(self.addr)
-        print(f"[ZmqPublisherV2] Cam{self.camera_id} PUSH {self.addr} pose={'yes' if pose_4x4 is not None else 'no'}")
-        if self.pose_4x4 is not None:
-            T = np.asarray(self.pose_4x4, dtype=np.float32).reshape(4,4)
-            pretty = "\n".join("   " + " ".join(f"{v: .6f}" for v in row) for row in T)
-            print(f"[Cam{self.camera_id}] T_wc (row-major, meters):\n{pretty}")
-
-    def _extract(self, frame):
-        """Return (bgr, rgb_jpeg_or_None, depth_u16, (w,h), intr[4] or None, ts_us)."""
-        bgr = None; jpg = None; depth = None; size = None; intr = None; ts = None
-
-        if isinstance(frame, tuple) and len(frame) == 3:
-            bgr, depth, cfg = frame
-            if bgr is not None:
-                h, w = bgr.shape[:2]; size = (w, h)
-            elif depth is not None and hasattr(depth, "shape"):
-                h, w = depth.shape[:2]; size = (w, h)
-            if hasattr(cfg, "fx"):
-                intr = np.array([cfg.fx, cfg.fy, cfg.cx, cfg.cy], dtype=np.float32)
-            if hasattr(cfg, "timestamp_us"):
-                ts = int(cfg.timestamp_us)
-
-        if isinstance(frame, dict):
-            bgr   = frame.get("bgr") or frame.get("rgb") or frame.get("color") or bgr
-            jpg   = frame.get("rgb_jpeg") or frame.get("jpeg") or jpg
-            depth = frame.get("depth_u16") or frame.get("depth") or depth
-            wh    = frame.get("size")
-            size  = size or (wh if wh is not None else (frame.get("width"), frame.get("height")))
-            intr  = frame.get("intrinsics") or frame.get("intr") or intr
-            ts    = frame.get("timestamp_us") or frame.get("ts_us") or ts
-
-        if size is None:
-            if bgr is not None: h, w = bgr.shape[:2]; size = (w, h)
-            elif depth is not None and hasattr(depth, "shape"): h, w = depth.shape[:2]; size = (w, h)
-            else: raise ValueError("No size could be inferred from frame.")
-        w, h = int(size[0]), int(size[1])
-
-        if depth is None:
-            return None, None, None, (w, h), intr, int(ts if ts is not None else time.time()*1e6)
-
-        depth = np.asarray(depth, dtype=np.uint16).reshape(h, w)
-        intr  = None if intr is None else np.asarray(intr, dtype=np.float32).reshape(4)
-        ts    = int(ts if ts is not None else time.time() * 1e6)
-        return bgr, jpg, depth, (w, h), intr, ts
-
-    def push(self, frame):
-        bgr, jpg, depth, (w, h), intr, ts = self._extract(frame)
-        if depth is None:
-            return
-        if jpg is None:
-            if bgr is None:
-                return
-            ok, enc = cv2.imencode(".jpg", np.asarray(bgr), [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
-            if not ok:
-                return
-            jpg = enc.tobytes()
-        payload = self.packet.pack(
-            camera_id=self.camera_id, timestamp_us=ts,
-            width=w, height=h, rgb_jpeg_bytes=jpg, depth_u16=depth,
-            intrinsics=intr, pose_Twc=self.pose_4x4
-        )
-        try:
-            self.sock.send(payload, flags=zmq.NOBLOCK)
-        except zmq.Again:
-            pass
-
-# ================= Intrinsics helpers (ROI / stride adjustment) =================
+# ================= Intrinsics helpers (ROI / stride) =================
 
 def _intr_get(i):
     if i is None: return None
@@ -433,19 +373,26 @@ def _intr_set(i, fx, fy, cx, cy, kind):
     return i
 
 def _adjust_intrinsics_for_roi_stride(intr, global_cfg):
-    """Apply ROI shift and downsample scaling to intrinsics in-place."""
+    """
+    Apply ROI shift + downsample scaling to intrinsics in-place
+    so Unity gets numbers that match the actually-sent images.
+    """
     tup = _intr_get(intr)
     if tup is None:
         return intr
     fx, fy, cx, cy, kind = tup
+
     roi = global_cfg.get("roi_xywh")
-    s   = int(global_cfg.get("downsample_stride", 1) or 1)
+    stride = int(global_cfg.get("downsample_stride", 1) or 1)
+
     if roi:
         x0, y0 = int(roi[0]), int(roi[1])
         cx -= x0
         cy -= y0
-    if s > 1:
-        fx /= s; fy /= s; cx /= s; cy /= s
+
+    if stride > 1:
+        fx /= stride; fy /= stride; cx /= stride; cy /= stride
+
     return _intr_set(intr, fx, fy, cx, cy, kind)
 
 # ================= Strategy factory =================
@@ -476,14 +423,16 @@ def make_strategy(cam_cfg: dict, global_cfg: dict):
                 align_to_color=align_to_color,
                 align=align_to_color
             )
-        return _FallbackAzureK4A(device_index=cam_cfg.get("device", 0),
-                                 color_res=color_res, align_to_color=align_to_color)
+        return _FallbackAzureK4A(
+            device_index=cam_cfg.get("device", 0),
+            color_res=color_res,
+            align_to_color=align_to_color
+        )
 
     if cam_type in ("oak", "oakd", "luxonis"):
         try:
             from streamer.Source import LuxonisCameraStrategy as _LXS
             w, h = color_res
-            # Prefer MXID for multi-device
             return _safe_construct(
                 _LXS,
                 width=w, height=h,
@@ -524,13 +473,14 @@ def resolve_port(cam_cfg: dict, base_port: int) -> int:
     p = cam_cfg.get("port")
     return int(p) if p is not None else int(base_port) + (int(cam_cfg["id"]) - 1)
 
-# ======================== Pipeline worker ========================
+# ======================== One camera pipeline thread ========================
 
 class CameraPipeline(threading.Thread):
     def __init__(self, cam_cfg: dict, global_cfg: dict,
                  preview_rgb: bool, preview_depth: bool,
                  depth_min_mm: int, depth_max_mm: int, depth_cmap_code: int):
         super().__init__(daemon=True)
+
         self.cam_id = int(cam_cfg["id"])
         self.port = resolve_port(cam_cfg, int(global_cfg.get("base_port", 5555)))
         self.fps_max = int(global_cfg.get("fps_max", 30))
@@ -542,49 +492,73 @@ class CameraPipeline(threading.Thread):
         self.depth_max_mm = int(depth_max_mm)
         self.depth_cmap_code = int(depth_cmap_code)
 
-        pose = None
+
+        # Load pose from file (camera -> calibration world)
+        pose_raw = None
         if cam_cfg.get("pose_file"):
             pose_dir = Path(global_cfg.get("pose_dir", "."))
             p = Path(cam_cfg["pose_file"])
             if not p.is_absolute():
                 p = pose_dir / p
-            pose = load_pose_4x4(str(p))
-        self.pose = pose
+            pose_raw = load_pose_4x4(str(p))
+
+        # Convert that pose into Unity coordinates (camera -> Unity world)
+        pose_unity = pose_to_unity_coords(pose_raw)
+        self.pose = pose_unity
+
+
+        if self.pose is not None:
+            print(f"[Cam{self.cam_id}] T_cam_to_unity (row-major):")
+            for r in range(4):
+                print("    " + " ".join(f"{self.pose[r,c]: .6f}" for c in range(4)))
+        else:
+            print(f"[Cam{self.cam_id}] No pose file, using identity in publisher.")
+
 
         self.global_cfg = global_cfg
         self.strategy = make_strategy(cam_cfg, global_cfg)
 
-        # Decide how to interact (context or direct)
+        # Wrap strategy in CameraContext if available, else use it directly
         if CameraContext and hasattr(CameraContext, "__call__"):
             self.ctx = CameraContext(self.strategy)
             self._grab  = self.ctx.get_frame
-            self._open  = getattr(self.ctx, "init", getattr(self.ctx, "connect", getattr(self.ctx, "open", None)))
+            self._open  = getattr(self.ctx, "init",
+                          getattr(self.ctx, "connect",
+                          getattr(self.ctx, "open", None)))
             self._close = getattr(self.ctx, "close", lambda: None)
         else:
             self.ctx = self.strategy
             self._grab  = getattr(self.ctx, "get_frame", None)
-            self._open  = getattr(self.ctx, "connect", getattr(self.ctx, "open", None))
+            self._open  = getattr(self.ctx, "connect",
+                          getattr(self.ctx, "open", None))
             self._close = getattr(self.ctx, "close", lambda: None)
 
-        # Build processing steps chain from YAML
+        # Pre / post steps (Clamp → Median → ROI crop → Downsample, etc.)
         self.steps = build_default_steps(global_cfg)
 
+        # This publisher creates and binds a PUSH socket on tcp://0.0.0.0:<port>
+        # Unity connects with PULL to that same port.
         self.pub = ZmqPublisherV2(
-            port=self.port, camera_id=self.cam_id, pose_4x4=self.pose,
+            port=self.port,
+            camera_id=self.cam_id,
+            pose_4x4=self.pose,
             jpeg_quality=int(global_cfg.get("jpeg_quality", 80)),
             send_intrinsics=bool(global_cfg.get("send_intrinsics", True)),
         )
+
         self._fps_t0 = time.time()
         self._fps_n = 0
         self._next_deadline = time.time()
+
+        # optional stagger so multiple devices don't all init at once
         self.startup_delay_s = float(global_cfg.get("open_stagger_ms", 600)) * 0.001 * (self.cam_id - 1)
 
     def run(self):
         try:
-            # stagger opening per cam to avoid multi-device boot contention
             if self.startup_delay_s > 0:
                 time.sleep(self.startup_delay_s)
-            if self._open: self._open()
+            if self._open:
+                self._open()
         except Exception as e:
             print(f"[Cam{self.cam_id}] FAILED to open device on port {self.port}: {e}")
             return
@@ -598,36 +572,39 @@ class CameraPipeline(threading.Thread):
                 if isinstance(tup, tuple) and len(tup) == 3:
                     rgb, depth, cfg = tup
 
-                    # Steps (Clamp → Median → ROI → Downsample)
+                    # Apply processing steps
                     for s in self.steps:
                         try:
                             rgb, depth = s.process(rgb, depth)
                         except Exception:
+                            # don't break stream if one step fails
                             pass
 
-                    # Adjust intrinsics for ROI/stride (must match what the steps did)
+                    # Fix intrinsics to match crop/downsample
                     try:
                         cfg = _adjust_intrinsics_for_roi_stride(cfg, self.global_cfg)
                     except Exception:
                         pass
 
-                    # Depth preview
+                    # Optional window preview
                     depth_bgr = None
                     if self.preview_depth and depth is not None:
-                        depth_bgr = _colorize_depth_mm(depth, self.depth_min_mm, self.depth_max_mm, self.depth_cmap_code)
-
-                    # RGB preview
+                        depth_bgr = _colorize_depth_mm(
+                            depth, self.depth_min_mm, self.depth_max_mm, self.depth_cmap_code
+                        )
                     if self.preview_rgb:
                         PREVIEW.update(self.cam_id, rgb, depth_bgr)
 
-                    # Send
+                    # Push to ZMQ
                     self.pub.push((rgb, depth, cfg))
                 else:
+                    # If strategy returns a dict-like frame already shaped for PacketV2Writer
                     self.pub.push(tup)
 
+                # FPS accounting
                 self._fps_n += 1
 
-                # Optional FPS throttle
+                # Throttle to fps_max if requested
                 if self.frame_period > 0:
                     self._next_deadline += self.frame_period
                     now = time.time()
@@ -636,7 +613,7 @@ class CameraPipeline(threading.Thread):
                     else:
                         self._next_deadline = now
 
-                # Periodic FPS log
+                # Log ~every 2s
                 now = time.time()
                 if now - self._fps_t0 >= 2.0:
                     fps = self._fps_n / (now - self._fps_t0)
@@ -645,8 +622,10 @@ class CameraPipeline(threading.Thread):
                     self._fps_n = 0
 
         finally:
-            try: self._close()
-            except: pass
+            try:
+                self._close()
+            except:
+                pass
 
 # ============================= Main =============================
 
@@ -656,46 +635,111 @@ def parse_args():
     ap.add_argument("--preview-depth", action="store_true", help="Show colorized depth preview")
     ap.add_argument("--depth-min", type=int, default=None, help="Depth min (mm) for preview normalization")
     ap.add_argument("--depth-max", type=int, default=None, help="Depth max (mm) for preview normalization")
-    ap.add_argument("--depth-cmap", type=str, default=None, help="OpenCV colormap name (e.g., JET, TURBO, INFERNO, VIRIDIS, MAGMA)")
+    ap.add_argument("--depth-cmap", type=str, default=None,
+                    help="OpenCV colormap name (e.g., JET, TURBO, INFERNO, VIRIDIS, MAGMA)")
     return ap.parse_args()
 
 def main():
     args = parse_args()
+
     cfg_path = Path("config/multicam.yaml")
     if not cfg_path.exists():
         print(f"Config not found: {cfg_path}")
         print("Example:\n"
               "global:\n"
-              "  base_port: 5555\n  jpeg_quality: 80\n  fps_max: 30\n  send_intrinsics: true\n  align_to_color: true\n"
-              "  pose_dir: ./poses\n  preview: false\n  preview_depth: false\n  depth_min_mm: 400\n  depth_max_mm: 6000\n  depth_colormap: JET\n"
+              "  base_port: 5555\n"
+              "  jpeg_quality: 80\n"
+              "  fps_max: 30\n"
+              "  send_intrinsics: true\n"
+              "  align_to_color: true\n"
+              "  pose_dir: ./poses\n"
+              "  preview: false\n"
+              "  preview_depth: false\n"
+              "  depth_min_mm: 400\n"
+              "  depth_max_mm: 6000\n"
+              "  depth_colormap: JET\n"
+              "  discovery_port: 5554\n"
               "cameras:\n"
-              "  - id: 1\n    type: oak\n    mxid: \"YOUR_DEVICE_MXID\"\n    port: 5555\n    color_res: [1280, 720]\n")
+              "  - id: 1\n"
+              "    type: oak\n"
+              "    mxid: \"YOUR_DEVICE_MXID\"\n"
+              "    port: 5555\n"
+              "    color_res: [1280, 720]\n")
         sys.exit(1)
 
     cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
     global_cfg = cfg.get("global", {})
     cameras = cfg.get("cameras", [])
     if not cameras:
-        print("No cameras in config."); sys.exit(1)
+        print("No cameras in config.")
+        sys.exit(1)
 
-    # Preview options (YAML or CLI)
+    # Preview settings (CLI overrides YAML)
     preview_rgb = bool(global_cfg.get("preview", False) or args.preview)
     preview_depth = bool(global_cfg.get("preview_depth", False) or args.preview_depth)
+
     dmin = int(args.depth_min if args.depth_min is not None else global_cfg.get("depth_min_mm", 400))
     dmax = int(args.depth_max if args.depth_max is not None else global_cfg.get("depth_max_mm", 6000))
-    cmap_name_or_code = args.depth_cmap if args.depth_cmap is not None else global_cfg.get("depth_colormap", "JET")
+
+    cmap_name_or_code = (
+        args.depth_cmap
+        if args.depth_cmap is not None
+        else global_cfg.get("depth_colormap", "JET")
+    )
     depth_cmap_code = _resolve_colormap_code(cmap_name_or_code)
 
     if preview_rgb or preview_depth:
         PREVIEW.enable(preview_rgb, preview_depth)
 
+    # ------------------------------------------------------------
+    # Start UDP discovery responder so Quest can auto-find this PC
+    # ------------------------------------------------------------
+    try:
+        disc_port = int(global_cfg.get("discovery_port", 5554))
+        start_udp_discovery_responder(disc_port)
+    except Exception as e:
+        print(f"[discovery] Failed to start responder: {e}")
+
+    # ------------------------------------------------------------
+    # Optional: IRIS auto-spawn (safe to leave, no effect if unused)
+    # ------------------------------------------------------------
+    try:
+        do_autospawn = bool(global_cfg.get("iris_autospawn", True))
+        if do_autospawn:
+            timeout_s  = float(global_cfg.get("iris_timeout_s", 3.0))
+            scene_name = str(global_cfg.get("iris_scene_name", "PointCloudViz"))
+            print(f"[IRIS] Discovering Unity IRIS node (timeout {timeout_s:.1f}s)...")
+            info = discover_iris_unity(timeout=timeout_s)
+            print(f"[IRIS] Found node at {info['ip']}:{info['port']} (node {info['node_id']})")
+            spawn_sim_scene(info["ip"], info["port"], scene_name=scene_name)
+    except Exception as e:
+        print(f"[IRIS] Discovery/spawn skipped or failed: {e}")
+
+    # ------------------------------------------------------------
+    # Spin up each camera capture + publisher thread
+    # ------------------------------------------------------------
     print("=== Streamer (N-cam unified) ===")
     for c in cameras:
         port = resolve_port(c, int(global_cfg.get("base_port", 5555)))
-        print(f"  - Cam{c['id']}: type={c.get('type','azure')} port={port} pose={'yes' if c.get('pose_file') else 'no'}")
+        has_pose = "yes" if c.get("pose_file") else "no"
+        print(f"  - Cam{c['id']}: type={c.get('type','azure')} port={port} pose={has_pose}")
 
-    workers = [CameraPipeline(c, global_cfg, preview_rgb, preview_depth, dmin, dmax, depth_cmap_code) for c in cameras]
-    for w in workers: w.start()
+    workers = [
+        CameraPipeline(
+            c,
+            global_cfg,
+            preview_rgb,
+            preview_depth,
+            dmin,
+            dmax,
+            depth_cmap_code
+        )
+        for c in cameras
+    ]
+
+    for w in workers:
+        w.start()
+
     try:
         while True:
             time.sleep(0.5)
@@ -704,3 +748,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ============================= EOF =============================
+#  python .\Streamer.py --preview --preview-depth --depth-min 400 --depth-max 6000 --depth-cmap TURBO
+

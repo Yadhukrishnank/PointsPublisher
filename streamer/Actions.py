@@ -1,119 +1,86 @@
-from abc import ABC, abstractmethod
-import cv2
-import streamer.Datasources as ds
-import threading
-import time
-import socket
-import zmq
+# streamer/Actions.py
+import time, threading
+from typing import Optional, Tuple
 import numpy as np
-import struct
+import cv2
+import zmq
 
-class Action(ABC):
-    @abstractmethod
-    def execute(self, rgb_frame, depth_frame):
-        """Führt eine Aktion auf den verarbeiteten Frames aus"""
-        pass
+from streamer.net.PacketV2 import PacketV2Writer
 
+# ====================== Preview (RGB + Depth) ======================
+def _resolve_colormap_code(name_or_code):
+    if isinstance(name_or_code, int):
+        return int(name_or_code)
+    name = str(name_or_code).strip().upper()
+    return getattr(cv2, f"COLORMAP_{name}", cv2.COLORMAP_JET)
 
-class ShowImageAction(Action):
-    def __init__(self, window_name="RGB", depth_window_name="Depth"):
-        self.window_name = window_name
-        self.depth_window_name = depth_window_name
+def _colorize_depth_mm(depth_u16: np.ndarray, dmin: int, dmax: int, cmap_code: int) -> np.ndarray:
+    d = np.asarray(depth_u16, dtype=np.float32)
+    valid = d > 0
+    lo, hi = float(dmin), float(max(dmax, dmin + 1))
+    d = np.clip(d, lo, hi)
+    norm = (d - lo) * (255.0 / (hi - lo))
+    norm[~valid] = 0.0
+    img8 = norm.astype(np.uint8)
+    cm = cv2.applyColorMap(img8, cmap_code)
+    cm[~valid] = (0, 0, 0)
+    return cm
 
-    def execute(self, rgb_frame, depth_frame):
-        if rgb_frame is not None:
-            np_arr = np.frombuffer(rgb_frame.tobytes(), np.uint8)
-            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            cv2.imshow(self.window_name, img)
-        if depth_frame is not None:
-            depth_color = cv2.applyColorMap(
-                cv2.convertScaleAbs(depth_frame, alpha=0.03),
-                cv2.COLORMAP_JET
-            )
-            cv2.imshow(self.depth_window_name, depth_color)
-        cv2.waitKey(1)
-
-
-class ZMQPublishAction(Action):
-    # Camera Config contains all relevant information that is camera specific, like fx,fy,cx,cy,...
-    # This Information is also resolution specific, if the resolution changes with filtering for example
-    # the intrinsics has to be scaled, for example if height and width is 1/2, the scale is also 1/2
-    def __init__(self, culling: ds.Culling, config_scaling=1.0, port=5555):
-        self.culling = culling
-        self.config_scaling = config_scaling
-
-        self.start_discovery_server(port=5556)
-
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PUSH)
-        self.socket.setsockopt(zmq.SNDHWM, 1)
-        self.socket.bind(f"tcp://*:{port}")
-        print(f"[INFO] ZMQ Server läuft auf Port {port}...")
-
-    def execute(self, rgb_frame, depth_frame):
-        rgb_bytes = rgb_frame.tobytes()
-        depth_bytes = depth_frame.tobytes()
-
-        # Depends on Application, here this is my Packageformat
-        packet = (
-            struct.pack('<2I', self.width, self.height) +
-            struct.pack('<I', len(rgb_bytes)) + rgb_bytes +
-            struct.pack('<I', len(depth_bytes)) + depth_bytes +
-            struct.pack('<4f', self.config.fx*self.config_scaling, self.config.fy*self.config_scaling, self.config.cx*self.config_scaling, self.config.cy*self.config_scaling) +
-            struct.pack('<2f', self.culling.zcullmin, self.culling.zcullmax) +
-            struct.pack('<2f', self.culling.x_cull, self.culling.y_cull)
-        )
-        try:
-            self.socket.send(packet, zmq.NOBLOCK)
-        except zmq.Again:
-            pass
-
-    def start_discovery_server(self, port=5556, response_message=b"ZMQ_SERVER_HERE"):
-        def discovery_loop():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('', port))
-            print(f"[INFO] Discovery-Server läuft auf Port {port}...")
-
-            while True:
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    if data == b"DISCOVER_ZMQ_SERVER":
-                        print(f"[DISCOVERY] Anfrage von {addr[0]}")
-                        sock.sendto(response_message, addr)
-                except Exception as e:
-                    print("[ERROR] Discovery-Server:", e)
-                    break
-
-            sock.close()
-
-        thread = threading.Thread(target=discovery_loop, daemon=True)
-        thread.start()
-
-    def set_width_height(self, width, height):
-        self.width = width
-        self.height = height
-
-    def set_config(self, config: ds.CameraConfig):
-        self.config = config
-
-
-class ActionPipeline:
+class PreviewHub(threading.Thread):
     def __init__(self):
-        self.actions = []
+        super().__init__(daemon=True)
+        self.enabled_rgb = False
+        self.enabled_depth = False
+        self._run = False
+        self._lock = threading.Lock()
+        self._rgb = {}
+        self._depth = {}
 
-    def add_action(self, action: Action):
-        self.actions.append(action)
+    def enable(self, rgb: bool, depth: bool):
+        self.enabled_rgb = bool(rgb)
+        self.enabled_depth = bool(depth)
+        if (self.enabled_rgb or self.enabled_depth) and not self._run:
+            self._run = True
+            self.start()
 
-    def execute_all(self, rgb_frame, depth_frame):
-        for action in self.actions:
-            action.execute(rgb_frame, depth_frame)
+    def update(self, cam_id: int, bgr: np.ndarray | None, depth_bgr: np.ndarray | None):
+        if not self._run:
+            return
+        with self._lock:
+            if self.enabled_rgb and bgr is not None:
+                self._rgb[cam_id] = bgr
+            if self.enabled_depth and depth_bgr is not None:
+                self._depth[cam_id] = depth_bgr
+
+    def run(self):
+        while self._run:
+            imgs = []
+            with self._lock:
+                if self.enabled_rgb:
+                    imgs.extend(("RGB", cid, img) for cid, img in self._rgb.items())
+                if self.enabled_depth:
+                    imgs.extend(("Depth", cid, img) for cid, img in self._depth.items())
+
+            for kind, cid, img in imgs:
+                cv2.imshow(f"{kind} - Cam {cid}", img)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC aborts preview loop
+                self._run = False
+                break
+
+        cv2.destroyAllWindows()
+
+
+PREVIEW = PreviewHub()
+
+# =================== ZMQ publisher (per camera) ===================
+#
+# We bind a PUSH socket on tcp://0.0.0.0:<port>.
+# Unity/Quest creates a PULL socket and connects to tcp://<discovered_pc_ip>:<port>.
+# That matches the new auto-discovery flow (no manual IP in headset).
 
 class ZmqPublisherV2:
-    """
-    Terminal action: packs a v2 packet and PUSHes it.
-    Expects a frame with at least: bgr or rgb_jpeg, depth_u16, (w,h), intrinsics, timestamp_us
-    """
     def __init__(
         self,
         port: int,
@@ -121,91 +88,132 @@ class ZmqPublisherV2:
         pose_4x4: np.ndarray | None,
         jpeg_quality: int = 80,
         send_intrinsics: bool = True,
-        bind_host: str = "0.0.0.0"
+        bind_host: str = "0.0.0.0",
     ):
         self.camera_id = int(camera_id)
         self.pose_4x4 = pose_4x4
         self.jpeg_quality = int(jpeg_quality)
         self.packet = PacketV2Writer(send_intrinsics=send_intrinsics)
 
-        ctx = zmq.Context.instance()
-        self.sock = ctx.socket(zmq.PUSH)
+        # PUSH socket (sender binds, Quest connects with PULL)
+        self.ctx  = zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.PUSH)
+        self.sock.setsockopt(zmq.SNDHWM, 1)
+        self.sock.setsockopt(zmq.LINGER, 0)
         self.addr = f"tcp://{bind_host}:{int(port)}"
         self.sock.bind(self.addr)
-        print(f"[ZmqPublisherV2] Cam{self.camera_id} PUSH bind {self.addr} pose={'yes' if pose_4x4 is not None else 'no'}")
+        print(f"[ZmqPublisherV2] Cam{self.camera_id} PUSH {self.addr} "
+              f"pose={'yes' if pose_4x4 is not None else 'no'}")
+    # publisher--------------------------------------------------------
+        # ctx = zmq.Context.instance()
+        # self.sock = ctx.socket(zmq.PUB)    
+        # self.sock.setsockopt(zmq.SNDHWM, 1)
+        # self.sock.setsockopt(zmq.LINGER, 0)
+        # self.addr = f"tcp://{bind_host}:{int(port)}"
+        # self.sock.bind(self.addr)
+        # time.sleep(0.25)                        
+        # print(f"[ZmqPublisherV2] Cam{self.camera_id} PUB  {self.addr} "
+        #       f"pose={'yes' if pose_4x4 is not None else 'no'}")
+
+        if self.pose_4x4 is not None:
+            T = np.asarray(self.pose_4x4, dtype=np.float32).reshape(4, 4)
+            pretty = "\n".join(
+                "   " + " ".join(f"{v: .6f}" for v in row) for row in T
+            )
+            print(f"[Cam{self.camera_id}] T_wc (row-major, meters):\n{pretty}")
 
     def _extract(self, frame):
         """
-        Be tolerant to tuple/dataclass/dict frames.
-        Return (bgr, rgb_jpeg_or_None, depth_u16, (w,h), intr, ts_us)
+        Return (bgr, rgb_jpeg_or_None, depth_u16, (w,h), intr[4] or None, ts_us)
+        in a predictable shape for PacketV2Writer.
         """
-        bgr = None; jpg = None; depth = None; size = None; intr = None; ts = None
+        bgr = None
+        jpg = None
+        depth = None
+        size = None
+        intr = None
+        ts = None
 
-        # dict-like
+        # tuple style: (bgr, depth_u16, cfg_with_intrinsics)
+        if isinstance(frame, tuple) and len(frame) == 3:
+            bgr, depth, cfg = frame
+            if bgr is not None:
+                h, w = bgr.shape[:2]
+                size = (w, h)
+            elif depth is not None and hasattr(depth, "shape"):
+                h, w = depth.shape[:2]
+                size = (w, h)
+
+            if hasattr(cfg, "fx"):
+                intr = np.array([cfg.fx, cfg.fy, cfg.cx, cfg.cy], dtype=np.float32)
+
+            if hasattr(cfg, "timestamp_us"):
+                ts = int(cfg.timestamp_us)
+
+        # dict style (for future flexibility)
         if isinstance(frame, dict):
-            bgr   = frame.get("bgr")
-            jpg   = frame.get("rgb_jpeg")
-            depth = frame.get("depth_u16") or frame.get("depth")
-            size  = frame.get("size") or (frame.get("width"), frame.get("height"))
-            intr  = frame.get("intrinsics") or frame.get("intr")
-            ts    = frame.get("timestamp_us") or frame.get("ts_us")
+            bgr   = frame.get("bgr") or frame.get("rgb") or frame.get("color") or bgr
+            jpg   = frame.get("rgb_jpeg") or frame.get("jpeg") or jpg
+            depth = frame.get("depth_u16") or frame.get("depth") or depth
+            wh    = frame.get("size")
+            size  = size or (
+                wh if wh is not None
+                else (frame.get("width"), frame.get("height"))
+            )
+            intr  = frame.get("intrinsics") or frame.get("intr") or intr
+            ts    = frame.get("timestamp_us") or frame.get("ts_us") or ts
 
-        # tuple-like (bgr, depth, (w,h), intr [, ts_us])
-        if depth is None and isinstance(frame, tuple) and len(frame) >= 4:
-            bgr, depth, size, intr = frame[:4]
-            if len(frame) >= 5:
-                ts = frame[4]
-
-        # attribute-like
-        for name in ("bgr", "rgb", "color"):
-            if bgr is None and hasattr(frame, name):
-                bgr = getattr(frame, name)
-        for name in ("rgb_jpeg", "jpeg"):
-            if jpg is None and hasattr(frame, name):
-                jpg = getattr(frame, name)
-        for name in ("depth_u16", "depth"):
-            if depth is None and hasattr(frame, name):
-                depth = getattr(frame, name)
+        # final size resolution
         if size is None:
-            if hasattr(frame, "size"):
-                size = getattr(frame, "size")
-            elif hasattr(frame, "width") and hasattr(frame, "height"):
-                size = (getattr(frame, "width"), getattr(frame, "height"))
-        for name in ("intrinsics", "intr"):
-            if intr is None and hasattr(frame, name):
-                intr = getattr(frame, name)
-        for name in ("timestamp_us", "ts_us"):
-            if ts is None and hasattr(frame, name):
-                ts = getattr(frame, name)
-
-        # ensure types
+            if bgr is not None:
+                h, w = bgr.shape[:2]; size = (w, h)
+            elif depth is not None and hasattr(depth, "shape"):
+                h, w = depth.shape[:2]; size = (w, h)
+            else:
+                raise ValueError("No size could be inferred from frame.")
         w, h = int(size[0]), int(size[1])
-        depth = np.asarray(depth, dtype=np.uint16).reshape(h, w)
-        if intr is not None:
-            intr = np.asarray(intr, dtype=np.float32).reshape(4)
-        if ts is None:
-            ts = int(time.time() * 1e6)
 
-        return bgr, jpg, depth, (w, h), intr, int(ts)
+        if depth is None:
+            return None, None, None, (w, h), intr, int(ts if ts is not None else time.time() * 1e6)
+
+        depth = np.asarray(depth, dtype=np.uint16).reshape(h, w)
+        intr  = None if intr is None else np.asarray(intr, dtype=np.float32).reshape(4)
+        ts    = int(ts if ts is not None else time.time() * 1e6)
+        return bgr, jpg, depth, (w, h), intr, ts
 
     def push(self, frame):
-        bgr, jpg, depth, (w, h), intr, ts = self._extract(frame)
+        import cv2
 
+        bgr, jpg, depth, (w, h), intr, ts = self._extract(frame)
+        if depth is None:
+            return
+
+        # If we haven't been given a pre-encoded JPEG, encode now.
         if jpg is None:
-            # encode BGR to JPEG once here (keeps your pipeline unchanged)
-            ok, enc = cv2.imencode(".jpg", np.asarray(bgr), [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            if bgr is None:
+                return
+            ok, enc = cv2.imencode(
+                ".jpg",
+                np.asarray(bgr),
+                [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+            )
             if not ok:
-                # skip bad frames silently
                 return
             jpg = enc.tobytes()
 
         payload = self.packet.pack(
             camera_id=self.camera_id,
             timestamp_us=ts,
-            width=w, height=h,
+            width=w,
+            height=h,
             rgb_jpeg_bytes=jpg,
             depth_u16=depth,
             intrinsics=intr,
             pose_Twc=self.pose_4x4
         )
-        self.sock.send(payload, copy=False)
+
+        try:
+            self.sock.send(payload, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            # drop frame instead of blocking
+            pass
